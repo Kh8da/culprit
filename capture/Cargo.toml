@@ -1,0 +1,12 @@
+[package]
+name = "culprit-capture"
+version = "0.1.0"
+description = "Turns raw events from a play session (frames, packets, pings, per-second PC samples) into a Culprit recording."
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Kh8da/culprit"
+
+[dependencies]
+culpritcore = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,11 @@
+[package]
+name = "culpritcore"
+version = "0.1.0"
+description = "Turns a recording of a play session into a verdict: what made the game lag or stutter."
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Kh8da/culprit"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
