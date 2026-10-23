@@ -3,6 +3,7 @@
 
 use super::util::join_within;
 use super::Shared;
+use crate::log;
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -42,6 +43,7 @@ impl Hotkey {
                     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                         if msg.message == WM_HOTKEY {
                             let now = shared.now();
+                            log!("hotkey: marked {:.1} s", now / 1000.0);
                             shared.with(|s| s.collector.mark(now));
                         }
                     }
@@ -50,7 +52,10 @@ impl Hotkey {
             })
             .map_err(|e| e.to_string())?;
         match registered.recv_timeout(Duration::from_secs(2)) {
-            Ok(Some(thread_id)) => Ok(Hotkey { thread, thread_id }),
+            Ok(Some(thread_id)) => {
+                log!("hotkey: Ctrl+Alt+L registered");
+                Ok(Hotkey { thread, thread_id })
+            }
             _ => Err("the hotkey is taken".into()),
         }
     }

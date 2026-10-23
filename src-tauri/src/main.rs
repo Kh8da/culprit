@@ -3,6 +3,7 @@
 mod store;
 
 use culprit_capture::collector::{Live, Options};
+use culprit_capture::log;
 use culprit_capture::recorder::{self, Recorder};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,21 +84,32 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
     }
     if !recorder::elevated() {
         state.starting.store(false, Ordering::SeqCst);
+        log!("app: asking Windows to start Culprit again as administrator");
         let pid = std::process::id().to_string();
-        recorder::relaunch_elevated(&["--record", "--after", &pid])?;
+        recorder::relaunch_elevated(&["--record", "--after", &pid]).inspect_err(|e| log!("app: {e}"))?;
         app.exit(0);
         return Ok(());
     }
     let started = tauri::async_runtime::spawn_blocking(|| Recorder::start(Options::default())).await;
     state.starting.store(false, Ordering::SeqCst);
-    *state.recorder() = Some(started.map_err(|e| e.to_string())??);
+    let rec = started.map_err(|e| e.to_string())?.inspect_err(|e| log!("app: recording didn't start: {e}"))?;
+    *state.recorder() = Some(rec);
     Ok(())
 }
 
 /// Stops, works out the report, saves it and returns its id.
 fn finish(rec: Recorder, store: &Store) -> Result<Option<String>, String> {
     let session = culpritcore::summarize(&rec.stop());
-    store.save(&session)?;
+    store.save(&session).inspect_err(|e| log!("app: {e}"))?;
+    let r = &session.report;
+    log!(
+        "app: saved session {}: {:?} / {} stutters, {} lag spikes, ping {:?} ms",
+        session.id,
+        r.headline,
+        r.perf.as_ref().map_or(0, |p| p.stutters),
+        r.net.as_ref().map_or(0, |n| n.lag_spikes),
+        r.net.as_ref().and_then(|n| n.ping_ms).map(|p| p.round())
+    );
     Ok(Some(session.id))
 }
 
@@ -128,6 +140,12 @@ fn main() {
     if let Some(pid) = after {
         recorder::wait_for_exit(pid, Duration::from_secs(10));
     }
+    // A crash goes in the log before the app closes.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log!("app: crashed: {info}");
+        default_hook(info);
+    }));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -138,14 +156,27 @@ fn main() {
             }
         }))
         .setup(move |app| {
-            let dir = app.path().app_data_dir()?.join("sessions");
-            let state =
-                AppState { store: Store::new(dir), recorder: Mutex::new(None), starting: AtomicBool::new(false) };
+            let data = app.path().app_data_dir()?;
+            match log::open(&data.join("logs")) {
+                Ok(path) => log!(
+                    "app: Culprit {} started, administrator: {}, arguments {:?}, log at {}",
+                    env!("CARGO_PKG_VERSION"),
+                    recorder::elevated(),
+                    args.get(1..).unwrap_or_default(),
+                    path.display()
+                ),
+                Err(e) => eprintln!("couldn't open the log: {e}"),
+            }
+            let state = AppState {
+                store: Store::new(data.join("sessions")),
+                recorder: Mutex::new(None),
+                starting: AtomicBool::new(false),
+            };
             // The UI asks whether a recording is running as soon as it loads, so start first.
             if record_now && recorder::elevated() {
                 match Recorder::start(Options::default()) {
                     Ok(rec) => *state.recorder() = Some(rec),
-                    Err(e) => eprintln!("couldn't start recording: {e}"),
+                    Err(e) => log!("app: recording didn't start: {e}"),
                 }
             }
             app.manage(state);
@@ -170,11 +201,11 @@ fn main() {
             if let RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<AppState>() {
                     if let Some(rec) = state.recorder().take() {
-                        if let Err(e) = finish(rec, &state.store) {
-                            eprintln!("couldn't save the recording: {e}");
-                        }
+                        log!("app: closing while recording, saving the session first");
+                        let _ = finish(rec, &state.store);
                     }
                 }
+                log!("app: closed");
             }
         });
 }

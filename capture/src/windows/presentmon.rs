@@ -3,8 +3,9 @@
 
 use super::etw::stop_session;
 use super::util::{join_within, Owned};
-use super::Shared;
+use super::{Counts, Shared};
 use crate::frames::{presentmon_args, FrameFeed, PRESENTMON_SESSION};
+use crate::log;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::os::windows::io::AsRawHandle;
@@ -70,18 +71,23 @@ fn spawn(exe: &Path, job: &Owned) -> Result<Child, String> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("Couldn't start PresentMon: {e}"))?;
+    log!("frames: started {} (pid {}) with {:?}", exe.display(), child.id(), presentmon_args());
     // SAFETY: both handles are live; the child's stays open while `child` exists.
     let _ = unsafe { AssignProcessToJobObject(job.0, HANDLE(child.as_raw_handle())) };
     Ok(child)
 }
 
-/// Keeps the last lines PresentMon printed as errors, so its pipe never fills up.
+/// Keeps the last lines PresentMon printed as errors, and logs them, so its pipe never fills
+/// up and what it said can be read later.
 fn drain_errors(child: &mut Child) -> Arc<Mutex<VecDeque<String>>> {
     let lines = Arc::new(Mutex::new(VecDeque::new()));
     if let Some(stderr) = child.stderr.take() {
         let keep = lines.clone();
         let _ = std::thread::Builder::new().name("culprit presentmon errors".into()).spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    log!("PresentMon says: {}", line.trim_end());
+                }
                 let mut keep = keep.lock().unwrap_or_else(|e| e.into_inner());
                 keep.push_back(line);
                 if keep.len() > 6 {
@@ -107,15 +113,17 @@ pub struct FrameCapture {
 impl FrameCapture {
     pub fn start(shared: Arc<Shared>) -> Result<FrameCapture, String> {
         let exe = find().ok_or(MISSING)?;
+        log!("frames: using {}", exe.display());
         let job = Arc::new(job()?);
         let mut child = spawn(&exe, &job)?;
         let errors = drain_errors(&mut child);
         // When PresentMon can't start its trace it says why and exits straight away.
         for _ in 0..12 {
             std::thread::sleep(Duration::from_millis(100));
-            if let Ok(Some(_)) = child.try_wait() {
+            if let Ok(Some(status)) = child.try_wait() {
                 std::thread::sleep(Duration::from_millis(100));
                 let why = last_error(&errors);
+                log!("frames: PresentMon exited right away ({status})");
                 return Err(if why.is_empty() {
                     "PresentMon stopped right away.".into()
                 } else {
@@ -146,6 +154,8 @@ fn read_frames(shared: &Shared, exe: &Path, job: &Owned, mut child: Child, mut e
     let mut restarts = 0;
     loop {
         let mut feed = FrameFeed::new(shared.clock, shared.now());
+        let mut lines = 0u64;
+        let mut frames = 0u64;
         if let Some(stdout) = child.stdout.take() {
             let mut reader = BufReader::with_capacity(64 * 1024, stdout);
             let mut line = Vec::with_capacity(512);
@@ -155,12 +165,25 @@ fn read_frames(shared: &Shared, exe: &Path, job: &Owned, mut child: Child, mut e
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                if let Some((row, t)) = feed.line(&String::from_utf8_lossy(&line)) {
+                let text = String::from_utf8_lossy(&line);
+                lines += 1;
+                Counts::add(&shared.counts.presentmon_lines, 1);
+                // The header and first rows show what PresentMon actually prints.
+                if lines <= 3 {
+                    log!("frames: PresentMon line {lines}: {}", text.trim_end());
+                }
+                if let Some((row, t)) = feed.line(&text) {
+                    frames += 1;
+                    Counts::add(&shared.counts.frames, 1);
+                    if frames == 1 {
+                        log!("frames: first frame {row:?} at {t:.0} ms, clock at {:.0} ms", shared.now());
+                    }
                     shared.with(|s| s.collector.on_frame(&row, t));
                 }
             }
         }
-        let _ = child.wait();
+        let status = child.wait();
+        log!("frames: PresentMon ended ({status:?}) after {lines} lines, {frames} frames");
         if shared.stopping() {
             return;
         }
@@ -169,7 +192,7 @@ fn read_frames(shared: &Shared, exe: &Path, job: &Owned, mut child: Child, mut e
             return;
         }
         // PresentMon stopped by itself: start it again, a few times at most.
-        eprintln!("PresentMon stopped: {}", last_error(&errors));
+        log!("frames: PresentMon stopped by itself: {}", last_error(&errors));
         restarts += 1;
         if restarts > 3 {
             shared.note("Frame capture stopped partway through this session, so some frames are missing.");
@@ -184,7 +207,8 @@ fn read_frames(shared: &Shared, exe: &Path, job: &Owned, mut child: Child, mut e
                 errors = drain_errors(&mut c);
                 child = c;
             }
-            Err(_) => {
+            Err(e) => {
+                log!("frames: couldn't restart PresentMon: {e}");
                 shared.note("Frame capture stopped partway through this session, so some frames are missing.");
                 return;
             }

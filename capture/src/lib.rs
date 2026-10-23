@@ -6,6 +6,7 @@ pub mod clock;
 pub mod collector;
 pub mod frames;
 pub mod gpu;
+pub mod log;
 pub mod naming;
 pub mod netevents;
 pub mod procs;

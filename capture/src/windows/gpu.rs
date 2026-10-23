@@ -4,6 +4,7 @@
 
 use super::util::wide;
 use crate::gpu::{luid_tag, nvml_throttle};
+use crate::log;
 use culpritcore::model::GpuThrottle;
 use std::ffi::c_void;
 use windows::core::PCWSTR;
@@ -227,7 +228,22 @@ impl Sensors {
     pub fn new(adapter: Option<&Adapter>) -> Self {
         let nvml = adapter.filter(|a| a.vendor == NVIDIA).and_then(Nvml::open);
         let kmt = if nvml.is_none() { adapter.and_then(|a| Kmt::open(a.luid)) } else { None };
-        Sensors { nvml, kmt }
+        let source = if nvml.is_some() {
+            "NVIDIA's driver (NVML)"
+        } else if kmt.is_some() {
+            "Windows (D3DKMT)"
+        } else {
+            "nothing"
+        };
+        log!(
+            "gpu: {:?} (vendor {:#06x}), temperature and clock from {source}",
+            adapter.map(|a| &a.name),
+            adapter.map_or(0, |a| a.vendor)
+        );
+        let mut sensors = Sensors { nvml, kmt };
+        let first = sensors.read();
+        log!("gpu: first reading {:?} C, {:?} MHz, throttle {:?}", first.temp, first.clock, first.throttle);
+        sensors
     }
 
     pub fn read(&mut self) -> Reading {

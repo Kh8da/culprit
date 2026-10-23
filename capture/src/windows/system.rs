@@ -6,6 +6,7 @@ use super::gpu::{Adapter, Sensors};
 use super::net::Wifi;
 use super::util::{from_wide, wide};
 use crate::collector::ProcReading;
+use crate::log;
 use crate::naming::{self, Service};
 use crate::procs::{parse_process_list, ProcRates, RawProc};
 use culpritcore::model::{Machine, ProcessKind, SystemSample};
@@ -300,7 +301,9 @@ impl Pdh {
     fn open() -> Option<Pdh> {
         let mut query = PDH_HQUERY::default();
         // SAFETY: plain out-parameter.
-        if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
+        let status = unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) };
+        if status != 0 {
+            log!("performance counters: couldn't open a query (error {status:#x})");
             return None;
         }
         let add = |path: &str| {
@@ -318,6 +321,18 @@ impl Pdh {
             gpu_memory: add(r"\GPU Adapter Memory(*)\Dedicated Usage"),
             items: Vec::new(),
         };
+        let missing: Vec<&str> = [
+            ("cpu speed", pdh.cpu_perf),
+            ("pages read from disk", pdh.pages_in),
+            ("disk busy", pdh.disk_idle),
+            ("gpu engines", pdh.gpu_engine),
+            ("gpu memory", pdh.gpu_memory),
+        ]
+        .iter()
+        .filter(|(_, c)| c.is_none())
+        .map(|(name, _)| *name)
+        .collect();
+        log!("performance counters: missing {missing:?}");
         // Rates need two readings; take the first now.
         // SAFETY: valid query handle.
         unsafe { PdhCollectQueryData(query) };
@@ -427,7 +442,19 @@ impl Sampler {
             notes: Vec::new(),
         };
         s.set_wifi(wifi);
+        log!(
+            "sampler: {} services, {} drives, gpu adapter {:?}, Wi-Fi readable: {}",
+            s.services.values().map(Vec::len).sum::<usize>(),
+            s.devices.len(),
+            s.adapter,
+            s.wifi.is_some()
+        );
         s
+    }
+
+    /// The exe name of a process, from the last reading.
+    pub fn name_of(&self, pid: u32) -> Option<&str> {
+        self.names.get(&pid).map(String::as_str)
     }
 
     /// Takes the readings the first second's rates are measured from.

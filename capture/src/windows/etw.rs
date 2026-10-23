@@ -3,8 +3,9 @@
 //! address, stamped with the performance counter. Nothing inside a packet is read.
 
 use super::util::{join_within, wide};
-use super::Shared;
+use super::{Counts, Shared};
 use crate::collector::Packet;
+use crate::log;
 use crate::netevents::{self, SEND_RECV_EVENTS};
 use std::cell::RefCell;
 use std::sync::mpsc;
@@ -51,12 +52,23 @@ impl Properties {
 /// Stops a trace session by name; used for this trace, and for PresentMon's session, which
 /// makes PresentMon finish and exit on its own.
 pub fn stop_session(name: &str) {
-    let name = wide(name);
+    let wide_name = wide(name);
     let mut props = Properties::new();
     // SAFETY: the properties buffer has room for the session name the call writes back.
-    let _ = unsafe {
-        ControlTraceW(CONTROLTRACE_HANDLE::default(), PCWSTR(name.as_ptr()), props.get(), EVENT_TRACE_CONTROL_STOP)
+    let status = unsafe {
+        ControlTraceW(CONTROLTRACE_HANDLE::default(), PCWSTR(wide_name.as_ptr()), props.get(), EVENT_TRACE_CONTROL_STOP)
     };
+    let p = props.get();
+    if status == ERROR_SUCCESS {
+        log!(
+            "trace session {name} stopped: {} events lost, {} buffers written, {} real-time buffers lost",
+            p.EventsLost,
+            p.BuffersWritten,
+            p.RealTimeBuffersLost
+        );
+    } else {
+        log!("trace session {name}: stop said error {}", status.0);
+    }
 }
 
 fn start_session() -> Result<(), String> {
@@ -119,6 +131,7 @@ fn start_session() -> Result<(), String> {
     // Older Windows may not filter by event id; then take everything and skip the rest.
     let mut status = enable(Some(&params));
     if status != ERROR_SUCCESS {
+        log!("network trace: filtering by event id isn't supported (error {}), taking every event", status.0);
         status = enable(None);
     }
     if status != ERROR_SUCCESS {
@@ -132,6 +145,8 @@ fn start_session() -> Result<(), String> {
 struct Sink {
     shared: Arc<Shared>,
     batch: RefCell<Vec<Packet>>,
+    /// Event ids already shown in the log.
+    shown: RefCell<Vec<u16>>,
 }
 
 impl Sink {
@@ -158,7 +173,25 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     }
     let data = unsafe { std::slice::from_raw_parts(r.UserData as *const u8, r.UserDataLength as usize) };
     let t = sink.shared.clock.ms(h.TimeStamp as u64);
-    if let Some(p) = netevents::parse(h.EventDescriptor.Id, data, t) {
+    let id = h.EventDescriptor.Id;
+    let packet = netevents::parse(id, data, t);
+    Counts::add(&sink.shared.counts.net_events, 1);
+    // The first event of each kind, raw, so a layout that differs from what Culprit expects
+    // shows up in the log.
+    let mut shown = sink.shown.borrow_mut();
+    if shown.len() < 24 && !shown.contains(&id) {
+        shown.push(id);
+        log!(
+            "network trace: first event {id} (version {}), {} bytes [{}], stamped {t:.0} ms with the clock at {:.0} ms, read as {packet:?}",
+            h.EventDescriptor.Version,
+            data.len(),
+            log::hex(&data[..data.len().min(48)]),
+            sink.shared.now()
+        );
+    }
+    drop(shown);
+    if let Some(p) = packet {
+        Counts::add(&sink.shared.counts.packets, 1);
         let full = {
             let mut batch = sink.batch.borrow_mut();
             batch.push(p);
@@ -189,7 +222,11 @@ impl NetTrace {
         let thread = std::thread::Builder::new()
             .name("culprit network trace".into())
             .spawn(move || {
-                let sink = Box::new(Sink { shared, batch: RefCell::new(Vec::with_capacity(BATCH)) });
+                let sink = Box::new(Sink {
+                    shared,
+                    batch: RefCell::new(Vec::with_capacity(BATCH)),
+                    shown: RefCell::new(Vec::new()),
+                });
                 let mut name = wide(SESSION);
                 let mut logfile = EVENT_TRACE_LOGFILEW { LoggerName: PWSTR(name.as_mut_ptr()), ..Default::default() };
                 logfile.Anonymous1.ProcessTraceMode =
@@ -213,7 +250,10 @@ impl NetTrace {
             })
             .map_err(|e| e.to_string())?;
         match opened.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(NetTrace { thread }),
+            Ok(Ok(())) => {
+                log!("network trace: started");
+                Ok(NetTrace { thread })
+            }
             Ok(Err(e)) => {
                 stop_session(SESSION);
                 Err(e)

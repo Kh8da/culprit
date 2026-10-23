@@ -3,10 +3,11 @@
 //! traceroute that finds the provider's first hop, which is pings with a hop limit.
 
 use super::util::{from_wide, qpc, qpc_freq, Owned};
-use super::Shared;
+use super::{Counts, Shared};
+use crate::log;
 use crate::targets::{refine_rtt, wifi_band, wifi_quality, Route};
 use culpritcore::model::{Connection, LinkKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use windows::core::{GUID, PCWSTR};
@@ -291,6 +292,23 @@ impl Icmp {
     }
 }
 
+/// Windows' status code and the answering address in a reply buffer, for the log.
+fn raw_status(ip: IpAddr, buf: &[u64]) -> (u32, IpAddr) {
+    // SAFETY: the buffer is at least as large as either reply structure.
+    unsafe {
+        match ip {
+            IpAddr::V4(_) => {
+                let r = &*(buf.as_ptr() as *const ICMP_ECHO_REPLY);
+                (r.Status, IpAddr::V4(Ipv4Addr::from(r.Address.to_ne_bytes())))
+            }
+            IpAddr::V6(_) => {
+                let r = &*(buf.as_ptr() as *const ICMPV6_ECHO_REPLY_LH);
+                (r.Status, IpAddr::V6(v6_words(r.Address.sin6_addr)))
+            }
+        }
+    }
+}
+
 struct Pending {
     target: u32,
     ip: IpAddr,
@@ -304,6 +322,10 @@ struct Pending {
 /// for one answer before sending the next.
 pub fn run_pinger(shared: &Shared) {
     let icmp = Icmp::open();
+    log!("pings: IPv4 ready: {}, IPv6 ready: {}", icmp.v4.is_some(), icmp.v6.is_some());
+    // Each target's first answer and first failure go in the log.
+    let mut answered: HashSet<u32> = HashSet::new();
+    let mut failed: HashSet<u32> = HashSet::new();
     let freq = qpc_freq() as f64;
     let mut pending: Vec<Pending> = Vec::new();
     let mut due: HashMap<u32, f64> = HashMap::new();
@@ -323,8 +345,14 @@ pub fn run_pinger(shared: &Shared) {
                 Pending { target, ip, t: now, sent: qpc(), event: Owned(event), reply: Box::new([0; REPLY_BYTES / 8]) };
             // SAFETY: the reply buffer is boxed and kept in `pending` until its event is set.
             if unsafe { icmp.send(ip, Some(p.event.0), None, &mut p.reply[..]) } {
+                Counts::add(&shared.counts.pings_sent, 1);
                 pending.push(p);
             } else {
+                if failed.insert(target) {
+                    // SAFETY: reads this thread's last error, set by the failed send.
+                    let error = unsafe { windows::Win32::Foundation::GetLastError() };
+                    log!("pings: couldn't send to {ip} (target {target}): error {}", error.0);
+                }
                 shared.with(|s| s.collector.on_ping(target, now, None));
             }
         }
@@ -343,6 +371,19 @@ pub fn run_pinger(shared: &Shared) {
             let rtt = Icmp::parse(p.ip, &mut p.reply[..])
                 .filter(|(from, at_target, _)| *at_target && *from == p.ip)
                 .map(|(_, _, ms)| refine_rtt(ms, measured));
+            match rtt {
+                Some(ms) => {
+                    Counts::add(&shared.counts.ping_replies, 1);
+                    if answered.insert(p.target) {
+                        log!("pings: first answer from {} in {ms:.1} ms", p.ip);
+                    }
+                }
+                None if failed.insert(p.target) => {
+                    let (status, from) = raw_status(p.ip, &p.reply[..]);
+                    log!("pings: no answer from {} after {measured:.0} ms (status {status}, reply from {from})", p.ip);
+                }
+                None => {}
+            }
             shared.with(|s| s.collector.on_ping(p.target, p.t, rtt));
         }
     }

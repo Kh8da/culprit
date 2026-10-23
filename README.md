@@ -100,6 +100,11 @@ To record from a dev build on Windows, put
 `culprit.exe` (or point `CULPRIT_PRESENTMON` at it) and start `npx tauri dev` from an administrator terminal. The
 CI build ships PresentMon next to `Culprit.exe`.
 
+Every run appends to a plain text log at `%APPDATA%\app.culprit.lagfinder\logs\culprit.log`: what the PC and
+connection look like, whether frame capture, the network trace, pings, the hotkey and the GPU sensors started,
+the first raw network events, what PresentMon printed, a status line every 10 seconds and any crash. It holds
+the PC's hardware, program names and the IP addresses of your router, provider and game server, nothing else.
+
 ## License
 
 MIT. Geist and Geist Mono are under the SIL Open Font License (`ui/fonts/OFL.txt`). PresentMon is Intel's, under
