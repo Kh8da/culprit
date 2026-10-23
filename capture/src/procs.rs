@@ -55,7 +55,8 @@ pub fn parse_process_list(buf: &[u8], base: usize) -> Vec<RawProc> {
             .checked_sub(base)
             .filter(|&start| len > 0 && start.checked_add(len).is_some_and(|end| end <= buf.len()))
             .map(|start| {
-                let units: Vec<u16> = buf[start..start + len].chunks_exact(2).map(|c| u16_at(c, 0)).collect();
+                let units: Vec<u16> =
+                    buf[start..start + len].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
                 String::from_utf16_lossy(&units)
             })
             .unwrap_or_default();
