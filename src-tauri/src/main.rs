@@ -41,20 +41,19 @@ async fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), St
     state.store.delete(&id)
 }
 
-/// The example report, worked out once on first use.
+/// The example report, worked out once. Startup warms it in the background, so opening it
+/// is instant.
+fn example_bytes() -> &'static [u8] {
+    static EXAMPLE: OnceLock<Vec<u8>> = OnceLock::new();
+    EXAMPLE.get_or_init(|| {
+        let session = culpritcore::summarize(&culpritcore::demo::defender());
+        serde_json::to_vec(&session).unwrap_or_default()
+    })
+}
+
 #[tauri::command]
 async fn example_session() -> Result<Response, String> {
-    static EXAMPLE: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = tauri::async_runtime::spawn_blocking(|| {
-        EXAMPLE
-            .get_or_init(|| {
-                let session = culpritcore::summarize(&culpritcore::demo::defender());
-                serde_json::to_vec(&session).unwrap_or_default()
-            })
-            .clone()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let bytes = tauri::async_runtime::spawn_blocking(|| example_bytes().to_vec()).await.map_err(|e| e.to_string())?;
     Ok(Response::new(bytes))
 }
 
@@ -87,6 +86,7 @@ fn main() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?.join("sessions");
             app.manage(AppState { store: Store::new(dir) });
+            std::thread::spawn(example_bytes);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -101,4 +101,13 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running culprit");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn example_report_is_a_valid_session() {
+        let session: culpritcore::Session = serde_json::from_slice(super::example_bytes()).unwrap();
+        assert_eq!(session.report.headline, "Microsoft Defender caused 9 of your 11 stutters.");
+    }
 }
