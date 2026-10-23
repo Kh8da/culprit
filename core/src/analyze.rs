@@ -137,6 +137,16 @@ fn share(count: u32, of: u32, kind: IncidentKind) -> String {
     }
 }
 
+/// "during 3 of 12 stutters", or "during the only stutter".
+fn during(count: u32, of: u32, kind: IncidentKind) -> String {
+    let (one, many) = noun(kind);
+    if of == 1 {
+        format!("during the only {one}")
+    } else {
+        format!("during {count} of {of} {many}")
+    }
+}
+
 fn noun(kind: IncidentKind) -> (&'static str, &'static str) {
     match kind {
         IncidentKind::Stutter => ("stutter", "stutters"),
@@ -548,11 +558,11 @@ fn culprits(
             let mut why = match cause_cand(rec, &cause) {
                 Some(c) => {
                     let stats = if kind == IncidentKind::Lag { lag_stats } else { st_stats };
-                    let during = incidents
+                    let hits = incidents
                         .iter()
                         .filter(|i| i.kind == kind)
                         .filter(|i| ctx.covering(i.t - 1000.0, i.t + i.dur + 300.0).any(|s| ctx.active(c, s)))
-                        .count();
+                        .count() as u32;
                     let base = stats.get(&c).map(|s| s.base_rate()).unwrap_or(0.0);
                     let otherwise = if base < 0.005 {
                         "and almost never otherwise".to_string()
@@ -569,28 +579,34 @@ fn culprits(
                         Cause::VramFull => "GPU memory was full".into(),
                         _ => "The GPU was throttling".into(),
                     };
-                    format!("{doing} during {during} of {of} {}, {otherwise}.", noun(kind).1)
+                    format!("{doing} {}, {otherwise}.", during(hits, of, kind))
                 }
                 None => match &cause {
                     Cause::HomeNetwork { .. } => {
-                        format!("Your router was slow or dropped pings during {count} of {of} lag spikes, so the trouble was before the internet.")
+                        format!("Your router was slow or dropped pings {}, so the trouble was before the internet.", during(count, of, kind))
                     }
                     Cause::Isp => format!(
-                        "Your router was fine, but your provider's first hop was slow or dropped pings during {count} of {of} lag spikes."
+                        "Your router was fine, but your provider's first hop was slow or dropped pings {}.",
+                        during(count, of, kind)
                     ),
                     Cause::Server => format!(
-                        "Everything up to your internet provider was fine during {count} of {of} lag spikes, so the trouble was further away."
+                        "Everything up to your internet provider was fine {}, so the trouble was further away.",
+                        during(count, of, kind)
                     ),
                     Cause::Unknown => "The game was waiting on something Culprit can't see, such as a driver, the disk or Windows.".into(),
-                    _ => format!("Nothing else on your PC was unusually busy during {count} of {of} {}.", noun(kind).1),
+                    _ => format!("Nothing else on your PC was unusually busy {}.", during(count, of, kind)),
                 },
             };
             let times: Vec<f64> = list.iter().map(|i| i.t).collect();
-            if let Some(every) = regular_interval(&times, 0.12) {
+            // Heat and power limits cycle on their own, so a regular rhythm only hints at a
+            // timer for apps, services and the network.
+            let timed = !matches!(cause, Cause::GpuThrottled | Cause::CpuSlowed) && !cause.is_game();
+            let every = regular_interval(&times, 0.12).filter(|_| timed);
+            if let Some(every) = every {
                 why.push_str(&format!(" It came back about every {:.0} seconds, which points to something on a timer.", every / 1000.0));
             }
             let mut fix = fix_for(&cause);
-            if matches!(cause, Cause::HomeNetwork { wifi: true }) && regular_interval(&times, 0.12).is_some() {
+            if matches!(cause, Cause::HomeNetwork { wifi: true }) && every.is_some() {
                 fix.push_str(" Wi-Fi lag on a timer is usually something scanning for networks in the background, which a cable avoids entirely.");
             }
             Culprit { title: cause.title(), cause, kind, count, of, confidence, why, fix }
@@ -650,7 +666,7 @@ fn fix_for(cause: &Cause) -> String {
         Cause::RamFull => "Your PC ran out of free memory, so Windows swapped to disk. Close browsers and other big apps before you play.".into(),
         Cause::VramFull => "The game filled the GPU's memory. Lower texture quality by one step.".into(),
         Cause::GpuThrottled => "Your GPU held itself back because of heat or power limits. Clean the dust out of its fans and check the case gets fresh air.".into(),
-        Cause::GameCpu => "The game itself was busy, often compiling shaders or loading a new area. These usually fade after the first match on a map; a GPU driver update clears old shader caches if they keep coming.".into(),
+        Cause::GameCpu => "The game itself was busy, often compiling shaders or loading a new area. These usually fade once you have played a map or area once. If they come back every session, look for a shader precompile option in the game's settings, or a game update.".into(),
         Cause::GameGpu => "The game sent the GPU an unusually heavy frame. Turning down the heaviest settings (shadows, ray tracing, volumetrics) smooths these out.".into(),
         Cause::GameLoading => "The game was loading data. Installing it on an SSD makes these shorter.".into(),
         Cause::Game => "Nothing else on your PC stood out, so these are on the game. Updating the game and your GPU driver is the best bet.".into(),

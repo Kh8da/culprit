@@ -29,7 +29,7 @@ pub struct Recording {
     pub notes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Machine {
     pub cpu: Option<String>,

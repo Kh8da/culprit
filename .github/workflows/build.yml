@@ -1,0 +1,82 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: tests and ui
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libayatana-appindicator3-dev
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Speed check (release build)
+        run: cargo test --release -p culpritcore --test scenarios long_sessions -- --nocapture
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: UI check in Chromium
+        run: |
+          cargo run --release -p culpritcore --example export_demo -- ui-dev/sessions
+          npm install --no-save playwright@1.56.1 http-server@14.1.1
+          npx playwright install --with-deps chromium
+          npx http-server -p 8765 -s . &
+          sleep 2
+          mkdir -p ui-shots
+          node ui-dev/check.js ui-shots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: ui-shots/*.png
+          if-no-files-found: ignore
+
+  windows:
+    name: windows app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build app
+        run: npx tauri build --no-bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: culprit-windows
+          path: target/release/Culprit.exe
+          if-no-files-found: error

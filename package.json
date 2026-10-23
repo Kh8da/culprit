@@ -1,0 +1,17 @@
+{
+  "name": "culprit",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  },
+  "description": "Finds what made your game lag or stutter: your Wi-Fi, your PC, or the server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kh8da/culprit"
+  }
+}

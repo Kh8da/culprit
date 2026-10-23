@@ -1,44 +1,79 @@
-# culprit
+<p align="center">
+  <img src="src-tauri/app-icon.png" width="96" alt="">
+</p>
 
-Your game lagged or stuttered. Was it your Wi-Fi, your PC, or the server? **culprit** records a play session
-and names the cause of each hitch, with the evidence and what to do about it.
+<h1 align="center">culprit</h1>
 
-> **Status: work in progress.** The analysis engine is built and tested. The Windows recorder that collects the
-> data on a real PC, and the app around it, aren't written yet, so there is nothing to download.
+<p align="center">Your game lagged or stuttered. Was it your Wi-Fi, your PC, or the server?</p>
 
-## What's here
+<br>
 
-| Crate | What it does |
-|---|---|
-| `core` (`culpritcore`) | Takes a recorded session and produces the verdict. It finds stutters (frames much slower than the ones just before) and lag spikes (slow or lost pings on the way to the game server, or the server going quiet). Then it decides what caused each one. |
-| `capture` (`culprit-capture`) | Turns raw events (frames, packets, pings, a once-a-second sample of the PC) into a recording. It works out which program is the game and which address is its server, groups background apps, and keeps the numbers for a live view. |
+**culprit** turns a play session into a verdict: what caused each stutter and lag spike, the evidence, and what
+to do about it.
 
-Neither crate calls the operating system, so both build and test anywhere.
+> **Status: work in progress.** The analysis engine, the app and its report screens are built and tested. The
+> Windows recorder that collects the data during a real game isn't written yet, so this build shows reports and
+> an example, but can't record. There is no download yet.
+
+## What a report tells you
+
+- **One verdict up top**, like "Microsoft Defender caused 9 of your 11 stutters." or "Your Wi-Fi caused all 11
+  of your lag spikes."
+- **The causes, ranked**, each with how sure culprit is, the evidence across the session, and a fix.
+- **Every moment**, with the numbers: "One frame took 118 ms (normally 6 ms)", "Microsoft Defender jumped to
+  41% of your CPU (it usually uses under 1%)."
+- **A timeline** of frame times and pings to your router, your provider and the game server, with every hitch
+  marked.
 
 ## How it decides
 
 - **Stutters.** Every second, each possible cause is either active or not: another app in a CPU or disk burst,
-  the CPU maxed out or slowed down, RAM or GPU memory full, the GPU throttling. A cause is only blamed when it is
-  active far more often during stutters than the rest of the time. An app that is always a little busy never
-  gets blamed for hitches it didn't cause. When nothing stands out, culprit says it was most likely the game
-  itself, and uses the frame's CPU and GPU busy time to tell shader-compile style hitches from GPU-heavy frames.
-- **Lag.** The router, the internet provider's first hop and the game server are pinged side by side. If the
-  router is slow too, it's your home network or Wi-Fi. If only the provider's hop is slow, it's the provider. If
-  both are fine, it's the server or the route to it. An app using lots of bandwidth at the same moment is checked
-  first.
-- **The hotkey.** Moments the player marks are matched to the nearest incident. If there is no incident nearby,
-  culprit reports what was worst in the seconds before.
+  the CPU maxed out or slowed down, RAM or GPU memory full, the GPU throttling. A cause is only blamed when it
+  is active far more often during stutters than the rest of the time, so an app that is always a little busy
+  never gets blamed for hitches it didn't cause. When nothing stands out, the frame's own CPU and GPU time tell
+  shader-compile hitches from heavy GPU frames.
+- **Lag.** The router, the provider's first hop and the game server are pinged side by side. If the router is
+  slow too, the trouble is your home network or Wi-Fi. If only the provider's hop is slow, it's the provider.
+  If both are fine, it's the server or the route to it. An app using lots of bandwidth at the same moment is
+  checked first.
+- **What it ignores.** The slow frames right after alt-tabbing back in, loading screens, the server going
+  quiet when a match ends, and single stray pings that routers drop on purpose.
 
-## Tests
+## Fast on purpose
+
+- A three-hour session at 240 fps (2.6 million frames, 120 background apps) is analyzed in under half a second.
+- The app is plain HTML, CSS and JavaScript with canvas charts and no framework. The release binary is about
+  4.6 MB.
+- Reports are sent to the screen as the saved bytes, never decoded and re-encoded on the way.
+
+## Layout
+
+| Folder | What it is |
+|---|---|
+| `core` | The analysis engine (`culpritcore`): detection, cause attribution, wording, charts, example sessions. |
+| `capture` | Builds a recording from raw events and works out which program is the game and which address is its server. |
+| `src-tauri` | The desktop app: session storage and the commands the UI calls. |
+| `ui` | The app's screens. |
+| `ui-dev` | A stand-in backend for previewing the UI in a browser, and the UI check. |
+
+## Build and test
 
 ```
-cargo test
+cargo test --workspace
+npm ci
+npx tauri dev
 ```
 
-`core/tests/scenarios.rs` builds whole sessions with a known culprit and checks the verdict. The scenarios cover
-Defender scans, Wi-Fi lag, provider trouble, server trouble, a server that ignores pings, a Steam download, an
-overheating GPU, a clean session and hotkey marks.
+To preview the UI in a browser with the example sessions:
+
+```
+cargo run --release -p culpritcore --example export_demo -- ui-dev/sessions
+npx http-server -p 8765 -s .
+```
+
+Then open `http://127.0.0.1:8765/ui/index.html`. Add `?record` to the address to try the live view with fake
+data. `node ui-dev/check.js` walks through every screen in Chromium and fails on any error.
 
 ## License
 
-MIT
+MIT. Geist and Geist Mono are under the SIL Open Font License (`ui/fonts/OFL.txt`).

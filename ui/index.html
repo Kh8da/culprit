@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Culprit</title>
+  <link rel="preload" href="fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="titlebar" data-tauri-drag-region>
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M1 11h3l2-6 3 9 2-5h4"/>
+      </svg>
+      <span>culprit</span>
+    </div>
+    <div class="window-buttons">
+      <button class="icon-btn" id="btn-min" aria-label="Minimize">
+        <svg viewBox="0 0 16 16"><path d="M3.5 8h9"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-max" aria-label="Maximize">
+        <svg viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>
+      </button>
+      <button class="icon-btn close" id="btn-close" aria-label="Close">
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="rail-head">
+        <span>sessions</span>
+        <span class="count" id="count"></span>
+      </div>
+      <button class="btn record" id="btn-record" hidden>
+        <span class="rec-dot"></span>Start recording
+      </button>
+      <div class="list" id="sessions" role="listbox" aria-label="Sessions" tabindex="0"></div>
+      <div class="rail-foot">
+        <button class="link" id="btn-example">Example report</button>
+      </div>
+    </aside>
+
+    <main class="main" id="main" tabindex="-1"></main>
+  </div>
+
+  <div class="tip" id="tip" role="tooltip"></div>
+  <div class="scrim" id="scrim" hidden>
+    <div class="dialog" id="dialog" role="dialog" aria-modal="true"></div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="timeline.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

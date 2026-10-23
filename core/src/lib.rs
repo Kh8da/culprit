@@ -5,6 +5,7 @@
 pub mod analyze;
 pub mod attribute;
 pub mod charts;
+pub mod demo;
 pub mod detect;
 pub mod model;
 pub mod names;
@@ -28,6 +29,8 @@ pub struct Session {
     pub version: u32,
     pub id: String,
     pub started_at: u64,
+    pub machine: model::Machine,
+    pub connection: model::Connection,
     pub report: Report,
     pub charts: charts::Charts,
 }
@@ -37,6 +40,8 @@ pub fn summarize(rec: &Recording) -> Session {
         version: SESSION_VERSION,
         id: rec.started_at.to_string(),
         started_at: rec.started_at,
+        machine: rec.machine.clone(),
+        connection: rec.connection.clone(),
         report: analyze(rec),
         charts: charts::build(rec),
     }
