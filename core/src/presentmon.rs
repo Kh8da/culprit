@@ -46,8 +46,8 @@ impl CsvLayout {
         let find = |wanted: &[&str]| wanted.iter().find_map(|w| names.iter().position(|n| n.eq_ignore_ascii_case(w)));
         let app = find(&["Application"]).ok_or("PresentMon output has no Application column")?;
         let pid = find(&["ProcessID"]).ok_or("PresentMon output has no ProcessID column")?;
-        let between_presents =
-            find(&["MsBetweenPresents", "FrameTime", "MsBetweenAppStart"]).ok_or("PresentMon output has no frame time column")?;
+        let between_presents = find(&["MsBetweenPresents", "FrameTime", "MsBetweenAppStart"])
+            .ok_or("PresentMon output has no frame time column")?;
         let time = if let Some(i) = find(&["TimeInQPC", "CPUStartQPC"]) {
             TimeCol::Qpc(i)
         } else if let Some(i) = find(&["TimeInSeconds", "CPUStartTimeInSeconds"]) {
@@ -133,7 +133,8 @@ mod tests {
         assert_eq!(r.pid, 77);
         assert!(layout.parse("").is_none());
         assert!(layout.parse("Stopped recording.").is_none());
-        let na_frame = "game.exe,1,0x0,DXGI,1,0,0,Composed: Flip,1000,NA,NA,16.6,0.1,1,1,999,16.6,2,14,1,2,2,0,NA,NA,0,NA,NA";
+        let na_frame =
+            "game.exe,1,0x0,DXGI,1,0,0,Composed: Flip,1000,NA,NA,16.6,0.1,1,1,999,16.6,2,14,1,2,2,0,NA,NA,0,NA,NA";
         assert!(layout.parse(na_frame).is_none());
     }
 

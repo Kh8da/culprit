@@ -5,25 +5,26 @@ pub fn median(values: &[f32]) -> Option<f32> {
     percentile(values, 50.0)
 }
 
-/// Linear-interpolated percentile (0 to 100) of the finite values.
+/// Linear-interpolated percentile (0 to 100) of the finite values. Runs in linear time,
+/// so it is safe on millions of frame times.
 pub fn percentile(values: &[f32], p: f32) -> Option<f32> {
     let mut v: Vec<f32> = values.iter().copied().filter(|x| x.is_finite()).collect();
     if v.is_empty() {
         return None;
     }
-    v.sort_by(|a, b| a.total_cmp(b));
     let rank = (p.clamp(0.0, 100.0) / 100.0) * (v.len() - 1) as f32;
     let lo = rank.floor() as usize;
-    let hi = rank.ceil() as usize;
     let frac = rank - lo as f32;
-    Some(v[lo] + (v[hi] - v[lo]) * frac)
+    let (_, &mut low, above) = v.select_nth_unstable_by(lo, |a, b| a.total_cmp(b));
+    if frac == 0.0 || above.is_empty() {
+        return Some(low);
+    }
+    let high = above.iter().copied().fold(f32::INFINITY, f32::min);
+    Some(low + (high - low) * frac)
 }
 
 pub fn mean(values: &[f32]) -> Option<f32> {
-    let (sum, n) = values
-        .iter()
-        .filter(|x| x.is_finite())
-        .fold((0.0f64, 0usize), |(s, n), &x| (s + x as f64, n + 1));
+    let (sum, n) = values.iter().filter(|x| x.is_finite()).fold((0.0f64, 0usize), |(s, n), &x| (s + x as f64, n + 1));
     (n > 0).then(|| (sum / n as f64) as f32)
 }
 
@@ -107,6 +108,8 @@ mod tests {
         assert_eq!(percentile(&v, 25.0), Some(2.0));
         assert_eq!(median(&[]), None);
         assert_eq!(mean(&[1.0, 2.0, 6.0]), Some(3.0));
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 50.0), Some(2.5));
+        assert_eq!(percentile(&[7.0], 99.0), Some(7.0));
     }
 
     #[test]

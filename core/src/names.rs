@@ -162,7 +162,7 @@ pub fn never_the_game(exe: &str) -> bool {
     ) || exe.to_ascii_lowercase().starts_with("presentmon")
 }
 
-/// "cs2.exe" → "cs2", for when nothing better is known.
+/// Turns "cs2.exe" into "cs2", for when nothing better is known.
 pub fn exe_stem(exe: &str) -> &str {
     let base = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
     match base.len().checked_sub(4) {

@@ -15,7 +15,12 @@ impl Sim {
         let mut rec = Recording {
             started_at: 1_790_000_000_000,
             duration_ms: secs as f64 * 1000.0,
-            machine: Machine { logical_cpus: 8, mem_total_mb: Some(16_000.0), vram_total_mb: Some(8_192.0), ..Default::default() },
+            machine: Machine {
+                logical_cpus: 8,
+                mem_total_mb: Some(16_000.0),
+                vram_total_mb: Some(8_192.0),
+                ..Default::default()
+            },
             game: Some(Game { name: "Counter-Strike 2".into(), exe: "cs2.exe".into(), pid: 4120, since: 0.0 }),
             connection: Connection { kind: LinkKind::Ethernet, ..Default::default() },
             ..Default::default()
@@ -106,7 +111,10 @@ fn defender_scans_cause_the_stutters() {
     });
     sim.process("discord.exe", "Discord", |_| ProcSample { cpu: 3.0, ..Default::default() });
     // Chrome bursts at random times that don't line up with the hitches.
-    sim.process("chrome.exe", "Google Chrome", |s| ProcSample { cpu: if s % 37 == 0 { 25.0 } else { 2.0 }, ..Default::default() });
+    sim.process("chrome.exe", "Google Chrome", |s| ProcSample {
+        cpu: if s % 37 == 0 { 25.0 } else { 2.0 },
+        ..Default::default()
+    });
     let report = analyze(&sim.rec);
     if std::env::var_os("CULPRIT_PRINT").is_some() {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -117,9 +125,16 @@ fn defender_scans_cause_the_stutters() {
     let top = &report.culprits[0];
     assert_eq!(top.cause, Cause::App { key: "msmpeng.exe".into(), label: "Microsoft Defender".into() });
     assert_eq!(top.confidence, Confidence::High);
-    assert!(top.why.starts_with("It was busy during 9 of 9 stutters"), "{}", top.why);
+    assert_eq!(
+        top.why,
+        "Microsoft Defender was in a CPU burst during 9 of 9 stutters, and only 2% of the rest of the time."
+    );
     assert!(top.fix.contains("Task Scheduler"));
-    assert!(report.incidents[0].evidence[0].contains("jumped to 38% of your CPU"), "{:?}", report.incidents[0].evidence);
+    assert!(
+        report.incidents[0].evidence[0].contains("jumped to 38% of your CPU"),
+        "{:?}",
+        report.incidents[0].evidence
+    );
     assert_eq!(report.mood, Mood::Fair);
 }
 
@@ -177,7 +192,11 @@ fn provider_lag_when_router_is_fine() {
     assert_eq!(report.headline, "Your internet provider caused all 5 of your lag spikes.");
     let inc = &report.incidents[0];
     assert!(inc.what.contains("pings to the server got no answer"), "{}", inc.what);
-    assert!(inc.evidence.iter().any(|e| e.starts_with("Your provider's first hop didn't answer")), "{:?}", inc.evidence);
+    assert!(
+        inc.evidence.iter().any(|e| e.starts_with("Your provider's first hop didn't answer")),
+        "{:?}",
+        inc.evidence
+    );
     assert!(inc.evidence.iter().any(|e| e.starts_with("Your router answered normally")), "{:?}", inc.evidence);
 }
 
@@ -236,7 +255,11 @@ fn steam_download_causes_lag() {
     sim.traffic(|_| false);
     let report = analyze(&sim.rec);
     assert_eq!(report.headline, "Steam caused all 6 of your lag spikes.", "{:#?}", report.culprits);
-    assert!(report.incidents[0].evidence[0].contains("Steam was downloading at 48 Mbit/s"), "{:?}", report.incidents[0].evidence);
+    assert!(
+        report.incidents[0].evidence[0].contains("Steam was downloading at 48 Mbit/s"),
+        "{:?}",
+        report.incidents[0].evidence
+    );
     assert!(report.culprits[0].fix.contains("Allow downloads during gameplay"));
 }
 
@@ -277,7 +300,7 @@ fn clean_session() {
     assert_eq!(report.headline, "No stutters or lag spikes.");
     assert_eq!(report.mood, Mood::Good);
     assert!(report.detail.starts_with("Counter-Strike 2 averaged 145 fps"), "{}", report.detail);
-    assert!(report.detail.contains("31 ms ping to the server"), "{}", report.detail);
+    assert!(report.detail.ends_with("Ping to the server was 31 ms."), "{}", report.detail);
     assert!(report.culprits.is_empty());
 }
 
@@ -319,4 +342,100 @@ fn sessions_round_trip_through_json() {
     let rec_json = serde_json::to_string(&sim.rec).unwrap();
     let rec_back: Recording = serde_json::from_str(&rec_json).unwrap();
     assert_eq!(rec_back.frames.len(), sim.rec.frames.len());
+}
+
+#[test]
+fn alt_tab_back_in_is_not_a_stutter() {
+    // The game runs at 144 fps, drops to 10 fps while in the background for 5 seconds,
+    // then comes back. The slow frames right after returning aren't stutters.
+    let mut sim = Sim::new(60);
+    let mut t = 0.0;
+    while t < 60_000.0 {
+        let background = (30_000.0..35_000.0).contains(&t);
+        let ms = if background || (35_000.0..35_300.0).contains(&t) { 100.0 } else { 6.9 };
+        t += ms as f64;
+        sim.rec.frames.push(Frame { t, ms, cpu_busy: None, gpu_busy: None });
+    }
+    for s in sim.rec.system.iter_mut() {
+        s.foreground = !(31_000.0..=35_000.0).contains(&s.t);
+    }
+    let report = analyze(&sim.rec);
+    assert_eq!(report.perf.as_ref().unwrap().stutters, 0, "{:#?}", report.incidents);
+    assert_eq!(report.headline, "No stutters or lag spikes.");
+}
+
+#[test]
+fn match_ending_is_not_lag() {
+    // In a match the server sends 60 packets a second. When the match ends it goes quiet
+    // for two seconds, then the lobby trickles in at a few packets a second.
+    let mut sim = Sim::new(120);
+    sim.frames(6.9, &[], false);
+    sim.target(1, TargetRole::Router, "192.168.1.1", |_| Some(1.0));
+    sim.target(3, TargetRole::Server, "155.133.250.9", |_| Some(30.0));
+    sim.traffic(|_| false);
+    for (i, b) in sim.rec.game_traffic.iter_mut().enumerate() {
+        let t = i as f64 * 100.0;
+        b.packets_in = if t < 60_000.0 {
+            6
+        } else if t < 62_000.0 {
+            0
+        } else if i % 5 == 0 {
+            1
+        } else {
+            0
+        };
+    }
+    let report = analyze(&sim.rec);
+    assert_eq!(report.net.as_ref().unwrap().lag_spikes, 0, "{:#?}", report.incidents);
+}
+
+#[test]
+fn mixed_session_mentions_the_other_kind() {
+    let mut sim = Sim::new(300);
+    let hitches: Vec<(f64, f32)> = (0..6).map(|i| (20_000.0 + i as f64 * 40_000.0, 90.0)).collect();
+    sim.frames(6.9, &hitches, true);
+    let bad = vec![50_000.0, 150_000.0];
+    let b = bad.clone();
+    sim.target(1, TargetRole::Router, "192.168.1.1", |_| Some(1.0));
+    sim.target(2, TargetRole::Isp, "80.10.0.1", |_| Some(9.0));
+    sim.target(3, TargetRole::Server, "155.133.250.9", move |t| Some(if near(t, &b, 750.0) { 300.0 } else { 30.0 }));
+    sim.traffic(|_| false);
+    let report = analyze(&sim.rec);
+    assert_eq!(report.headline, "Most stutters came from the game itself, not your PC.");
+    assert!(report.detail.contains("2 of the 2 lag spikes came from the game server."), "{}", report.detail);
+}
+
+#[test]
+fn long_sessions_analyze_fast() {
+    // Three hours at 240 fps with background apps and pings: the analysis has to stay quick.
+    let secs = 3 * 3600;
+    let mut sim = Sim::new(secs);
+    let hitches: Vec<(f64, f32)> = (0..400).map(|i| (5_000.0 + i as f64 * 26_000.0, 60.0)).collect();
+    sim.frames(4.2, &hitches, false);
+    for k in 0..120 {
+        let key = format!("app{k}.exe");
+        sim.process(&key, &key, move |s| ProcSample {
+            cpu: if (s + k) % 97 == 0 { 20.0 } else { 1.5 },
+            ..Default::default()
+        });
+    }
+    sim.target(1, TargetRole::Router, "192.168.1.1", |_| Some(1.0));
+    sim.target(
+        2,
+        TargetRole::Isp,
+        "80.10.0.1",
+        |t| if (t as u64 / 250).is_multiple_of(300) { None } else { Some(9.0) },
+    );
+    sim.target(3, TargetRole::Server, "155.133.250.9", |t| {
+        Some(if (t as u64 / 250).is_multiple_of(500) { 400.0 } else { 30.0 })
+    });
+    sim.traffic(|_| false);
+    assert!(sim.rec.frames.len() > 2_500_000);
+    let started = std::time::Instant::now();
+    let session = summarize(&sim.rec);
+    let took = started.elapsed();
+    // Debug builds are ~10x slower than release; this bound holds for both.
+    assert!(took.as_secs_f64() < 20.0, "took {took:?}");
+    assert!(session.report.perf.as_ref().unwrap().stutters >= 400);
+    eprintln!("3-hour session analyzed in {took:?}");
 }

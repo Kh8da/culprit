@@ -95,11 +95,20 @@ pub enum Confidence {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Cause {
     /// Another program used a burst of CPU.
-    App { key: String, label: String },
+    App {
+        key: String,
+        label: String,
+    },
     /// Another program hammered the disk.
-    AppDisk { key: String, label: String },
+    AppDisk {
+        key: String,
+        label: String,
+    },
     /// Another program used the internet connection heavily.
-    AppNetwork { key: String, label: String },
+    AppNetwork {
+        key: String,
+        label: String,
+    },
     CpuMaxed,
     CpuSlowed,
     RamFull,
@@ -114,7 +123,9 @@ pub enum Cause {
     /// Nothing else was going on, so the game itself.
     Game,
     /// Between the PC and the router.
-    HomeNetwork { wifi: bool },
+    HomeNetwork {
+        wifi: bool,
+    },
     /// The internet provider.
     Isp,
     /// The game server or the route to it.

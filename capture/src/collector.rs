@@ -21,6 +21,8 @@ const GAME_MIN_FPS: f32 = 20.0;
 const GAME_LOCK_SECONDS: u32 = 2;
 /// Seconds of frames kept for the live view.
 const LIVE_FRAMES_MS: f64 = 10_000.0;
+/// Anything stamped later than this is a clock glitch, not a real event.
+const MAX_T_MS: f64 = 24.0 * 3_600_000.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -56,6 +58,20 @@ pub struct Tick {
     /// Whole-PC numbers; the game and foreground fields are filled in here.
     pub sample: SystemSample,
     pub procs: Vec<ProcReading>,
+}
+
+/// One packet the network trace saw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Packet {
+    pub t: f64,
+    pub pid: u32,
+    pub remote: IpAddr,
+    /// The remote port, when the event makes it unambiguous (sends).
+    pub port: Option<u16>,
+    pub proto: Proto,
+    /// True for received packets.
+    pub inbound: bool,
+    pub bytes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,10 +226,13 @@ impl Collector {
 
     /// A frame PresentMon saw from any program; `t` is on the recording's clock.
     pub fn on_frame(&mut self, row: &PresentRow, t: f64) {
-        if t < 0.0 {
+        if !(0.0..MAX_T_MS).contains(&t) || !row.ms_between_presents.is_finite() {
             return;
         }
-        let p = self.presenters.entry(row.pid).or_insert_with(|| Presenter { exe: row.app.clone(), times: VecDeque::new() });
+        let p = self
+            .presenters
+            .entry(row.pid)
+            .or_insert_with(|| Presenter { exe: row.app.clone(), times: VecDeque::new() });
         p.times.push_back(t);
         if Some(row.pid) != self.game_pid {
             return;
@@ -243,9 +262,9 @@ impl Collector {
         self.rec.frames.push(frame);
     }
 
-    /// A packet from the network trace. `port` is the remote port when the event makes it
-    /// unambiguous (sends); `inbound` is true for received packets.
-    pub fn on_packet(&mut self, t: f64, pid: u32, remote: IpAddr, port: Option<u16>, proto: Proto, inbound: bool, bytes: u32) {
+    /// A packet from the network trace.
+    pub fn on_packet(&mut self, pk: Packet) {
+        let Packet { t, pid, remote, port, proto, inbound, bytes } = pk;
         let entry = self.pid_net.entry(pid).or_default();
         if inbound {
             entry.0 += bytes as u64;
@@ -254,7 +273,7 @@ impl Collector {
             entry.1 += bytes as u64;
             self.net_tick.1 += bytes as u64;
         }
-        if Some(pid) != self.game_pid || t < 0.0 {
+        if Some(pid) != self.game_pid || !(0.0..MAX_T_MS).contains(&t) {
             return;
         }
         let bin = (t / 100.0) as usize;
@@ -264,14 +283,14 @@ impl Collector {
         let b = &mut self.rec.game_traffic[bin];
         let f = self.flow_now.entry((remote, proto)).or_default();
         if inbound {
-            b.packets_in += 1;
-            b.bytes_in += bytes;
-            f.packets_in += 1;
+            b.packets_in = b.packets_in.saturating_add(1);
+            b.bytes_in = b.bytes_in.saturating_add(bytes);
+            f.packets_in = f.packets_in.saturating_add(1);
             f.bytes_in += bytes as u64;
         } else {
-            b.packets_out += 1;
-            b.bytes_out += bytes;
-            f.packets_out += 1;
+            b.packets_out = b.packets_out.saturating_add(1);
+            b.bytes_out = b.bytes_out.saturating_add(bytes);
+            f.packets_out = f.packets_out.saturating_add(1);
             f.bytes_out += bytes as u64;
             if let Some(port) = port {
                 *f.ports.entry(port).or_default() += 1;
@@ -345,7 +364,10 @@ impl Collector {
     }
 
     fn fps(&self, pid: u32, now: f64) -> f32 {
-        self.presenters.get(&pid).map(|p| p.times.iter().filter(|&&t| now - t <= 2_000.0).count() as f32 / 2.0).unwrap_or(0.0)
+        self.presenters
+            .get(&pid)
+            .map(|p| p.times.iter().filter(|&&t| now - t <= 2_000.0).count() as f32 / 2.0)
+            .unwrap_or(0.0)
     }
 
     fn detect_game(&mut self, tick: &Tick) -> Option<Event> {
@@ -365,7 +387,8 @@ impl Collector {
         }
         let fg = tick.foreground.last().copied().flatten();
         let candidate = fg.filter(|pid| {
-            self.presenters.get(pid).is_some_and(|p| !names::never_the_game(&p.exe)) && self.fps(*pid, now) >= GAME_MIN_FPS
+            self.presenters.get(pid).is_some_and(|p| !names::never_the_game(&p.exe))
+                && self.fps(*pid, now) >= GAME_MIN_FPS
         });
         match candidate {
             Some(pid) => {
@@ -427,7 +450,12 @@ impl Collector {
         self.server = Some(picked.ip);
         self.server_streak = None;
         let protocol = if picked.proto == Proto::Udp { "udp" } else { "tcp" };
-        self.rec.servers.push(ServerSeen { t, ip: picked.ip.to_string(), port: picked.port, protocol: protocol.into() });
+        self.rec.servers.push(ServerSeen {
+            t,
+            ip: picked.ip.to_string(),
+            port: picked.port,
+            protocol: protocol.into(),
+        });
         Some(Event::ServerChanged { ip: picked.ip, port: picked.port })
     }
 
@@ -439,7 +467,9 @@ impl Collector {
 
         let mut s = tick.sample;
         s.t = t;
-        s.foreground = self.game_pid.is_some() && !tick.foreground.is_empty() && tick.foreground.iter().all(|p| *p == self.game_pid);
+        s.foreground = self.game_pid.is_some()
+            && !tick.foreground.is_empty()
+            && tick.foreground.iter().all(|p| *p == self.game_pid);
         s.net_in = (self.net_tick.0 as f64 / dt) as f32;
         s.net_out = (self.net_tick.1 as f64 / dt) as f32;
 
@@ -457,7 +487,9 @@ impl Collector {
             if r.pid == 0 {
                 continue;
             }
-            let g = groups.entry(r.key.clone()).or_insert_with(|| (r.label.clone(), r.kind, ProcSample { t, ..Default::default() }));
+            let g = groups
+                .entry(r.key.clone())
+                .or_insert_with(|| (r.label.clone(), r.kind, ProcSample { t, ..Default::default() }));
             g.2.cpu += r.cpu;
             g.2.io += io;
             g.2.net_in += net_in;
@@ -589,7 +621,14 @@ mod tests {
     use culpritcore::presentmon::RowTime;
 
     fn row(pid: u32, app: &str, ms: f32) -> PresentRow {
-        PresentRow { app: app.into(), pid, time: RowTime::Ms(0.0), ms_between_presents: ms, cpu_busy: None, gpu_busy: None }
+        PresentRow {
+            app: app.into(),
+            pid,
+            time: RowTime::Ms(0.0),
+            ms_between_presents: ms,
+            cpu_busy: None,
+            gpu_busy: None,
+        }
     }
 
     fn collector() -> Collector {
@@ -597,7 +636,13 @@ mod tests {
     }
 
     fn tick(t: f64, fg: Option<u32>, procs: Vec<ProcReading>) -> Tick {
-        Tick { t, dt: 1.0, foreground: vec![fg; 4], sample: SystemSample { cpu: Some(30.0), ..Default::default() }, procs }
+        Tick {
+            t,
+            dt: 1.0,
+            foreground: vec![fg; 4],
+            sample: SystemSample { cpu: Some(30.0), ..Default::default() },
+            procs,
+        }
     }
 
     /// Feeds `secs` seconds of frames from each (pid, exe, fps), ticking once a second.
@@ -644,7 +689,12 @@ mod tests {
 
     #[test]
     fn named_process_wins() {
-        let mut c = Collector::new(Options { process: Some("Fake-Game.exe".into()), ..Default::default() }, 0, Machine::default(), Connection::default());
+        let mut c = Collector::new(
+            Options { process: Some("Fake-Game.exe".into()), ..Default::default() },
+            0,
+            Machine::default(),
+            Connection::default(),
+        );
         let ev = run(&mut c, 0.0, 1, &[(40, "fake-game.exe", 30.0)], None);
         assert_eq!(ev, vec![Event::GameLocked { pid: 40, exe: "fake-game.exe".into() }]);
     }
@@ -659,14 +709,46 @@ mod tests {
         for s in 0..4 {
             for i in 0..64 {
                 let t = s as f64 * 1000.0 + i as f64 * 15.0;
-                c.on_packet(t, 7, server, Some(27015), Proto::Udp, false, 80);
-                c.on_packet(t + 5.0, 7, server, None, Proto::Udp, true, 300);
+                c.on_packet(Packet {
+                    t,
+                    pid: 7,
+                    remote: server,
+                    port: Some(27015),
+                    proto: Proto::Udp,
+                    inbound: false,
+                    bytes: 80,
+                });
+                c.on_packet(Packet {
+                    t: t + 5.0,
+                    pid: 7,
+                    remote: server,
+                    port: None,
+                    proto: Proto::Udp,
+                    inbound: true,
+                    bytes: 300,
+                });
             }
             for i in 0..400 {
-                c.on_packet(s as f64 * 1000.0 + i as f64, 7, cdn, None, Proto::Tcp, true, 1400);
+                c.on_packet(Packet {
+                    t: s as f64 * 1000.0 + i as f64,
+                    pid: 7,
+                    remote: cdn,
+                    port: None,
+                    proto: Proto::Tcp,
+                    inbound: true,
+                    bytes: 1400,
+                });
             }
             // Someone else's traffic doesn't count toward the game.
-            c.on_packet(s as f64 * 1000.0, 99, server, Some(1), Proto::Udp, true, 50_000);
+            c.on_packet(Packet {
+                t: s as f64 * 1000.0,
+                pid: 99,
+                remote: server,
+                port: Some(1),
+                proto: Proto::Udp,
+                inbound: true,
+                bytes: 50_000,
+            });
             events.extend(c.on_tick(tick(s as f64 * 1000.0 + 1000.0, Some(7), vec![])));
         }
         assert_eq!(events, vec![Event::ServerChanged { ip: server, port: 27015 }]);
@@ -692,7 +774,15 @@ mod tests {
             cpu,
             io,
         };
-        c.on_packet(10.0, 300, "1.1.1.1".parse().unwrap(), None, Proto::Tcp, true, 5_000_000);
+        c.on_packet(Packet {
+            t: 10.0,
+            pid: 300,
+            remote: "1.1.1.1".parse().unwrap(),
+            port: None,
+            proto: Proto::Tcp,
+            inbound: true,
+            bytes: 5_000_000,
+        });
         let procs = vec![
             r(7, "cs2.exe", 40.0, 2_000_000.0),
             r(100, "chrome.exe", 3.0, 0.0),
@@ -717,11 +807,37 @@ mod tests {
     }
 
     #[test]
+    fn ignores_glitched_timestamps() {
+        let mut c = collector();
+        c.lock_game(7, "game.exe", 0.0);
+        c.on_packet(Packet {
+            t: 1e15,
+            pid: 7,
+            remote: "1.2.3.4".parse().unwrap(),
+            port: Some(1),
+            proto: Proto::Udp,
+            inbound: true,
+            bytes: 100,
+        });
+        c.on_frame(&row(7, "game.exe", 7.0), -5.0);
+        c.on_frame(&row(7, "game.exe", 7.0), 1e15);
+        let rec = c.finish(1000.0);
+        assert!(rec.game_traffic.is_empty());
+        assert!(rec.frames.is_empty());
+    }
+
+    #[test]
     fn live_view_counts_stutters_and_lag() {
         let mut c = collector();
         c.lock_game(7, "game.exe", 0.0);
         for i in 0..600 {
-            let ms = if i == 300 || i == 301 { 80.0 } else if i == 500 { 120.0 } else { 7.0 };
+            let ms = if i == 300 || i == 301 {
+                80.0
+            } else if i == 500 {
+                120.0
+            } else {
+                7.0
+            };
             c.on_frame(&row(7, "game.exe", ms), i as f64 * 7.0);
         }
         let server = c.add_target(TargetRole::Server, "155.133.250.9".parse().unwrap(), None, 0.0);

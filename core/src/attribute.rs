@@ -5,7 +5,7 @@
 //! is active far more often during incidents than the rest of the time (its "lift"), so a
 //! program that is always a little busy doesn't get blamed for stutters it didn't cause.
 
-use crate::model::{ProcessTrack, Recording, SystemSample};
+use crate::model::{ProcSample, ProcessTrack, Recording, SystemSample};
 use crate::stats::{median, percentile};
 use std::collections::HashMap;
 
@@ -66,8 +66,9 @@ impl CandStat {
 pub struct Ctx<'a> {
     pub rec: &'a Recording,
     pub sys: &'a [SystemSample],
-    /// Per process track: second → sample index.
-    by_second: Vec<HashMap<i64, usize>>,
+    /// Per process track: (system sample index, process sample index), sorted. Processes
+    /// are only recorded for seconds they were busy, so this stays short.
+    at: Vec<Vec<(usize, usize)>>,
     cpu_typical: Vec<f32>,
     io_typical: Vec<f32>,
     cpu_perf_ref: Option<f32>,
@@ -75,23 +76,60 @@ pub struct Ctx<'a> {
     pub bytes_per_mbit: f32,
 }
 
-fn second(t: f64) -> i64 {
-    (t / 1000.0).round() as i64
+/// Pairs each process sample with the system sample stamped closest to it, walking both
+/// time-ordered lists once.
+fn align(sys: &[SystemSample], samples: &[ProcSample]) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut i = 0;
+    for (j, s) in samples.iter().enumerate() {
+        while i + 1 < sys.len() && (sys[i + 1].t - s.t).abs() <= (sys[i].t - s.t).abs() {
+            i += 1;
+        }
+        if sys.get(i).is_some_and(|x| (x.t - s.t).abs() < 500.0) && out.last().is_none_or(|&(k, _)| k != i) {
+            out.push((i, j));
+        }
+    }
+    out
+}
+
+/// Median of `values` padded with zeros up to `total`, without building the padded list.
+fn median_with_zeros(values: &[f32], total: usize) -> f32 {
+    let total = total.max(values.len());
+    if total == 0 {
+        return 0.0;
+    }
+    let zeros = total - values.len();
+    let mut v: Vec<f32> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    v.sort_by(|a, b| a.total_cmp(b));
+    let nth = |k: usize| if k < zeros { 0.0 } else { v.get(k - zeros).copied().unwrap_or(0.0) };
+    if total % 2 == 1 {
+        nth(total / 2)
+    } else {
+        (nth(total / 2 - 1) + nth(total / 2)) / 2.0
+    }
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(rec: &'a Recording) -> Self {
         let sys = &rec.system[..];
-        let by_second: Vec<HashMap<i64, usize>> = rec
+        let at: Vec<Vec<(usize, usize)>> = rec
             .processes
             .iter()
-            .map(|p| p.samples.iter().enumerate().map(|(i, s)| (second(s.t), i)).collect())
+            .map(|p| {
+                if p.samples.windows(2).all(|w| w[0].t <= w[1].t) {
+                    align(sys, &p.samples)
+                } else {
+                    let mut sorted: Vec<(usize, &ProcSample)> = p.samples.iter().enumerate().collect();
+                    sorted.sort_by(|a, b| a.1.t.total_cmp(&b.1.t));
+                    let only: Vec<ProcSample> = sorted.iter().map(|x| *x.1).collect();
+                    align(sys, &only).into_iter().map(|(i, k)| (i, sorted[k].0)).collect()
+                }
+            })
             .collect();
         // Seconds a process wasn't recorded it was idle, so typical values count them as 0.
         let typical = |p: &ProcessTrack, f: fn(&crate::model::ProcSample) -> f32| {
-            let mut v: Vec<f32> = p.samples.iter().map(f).collect();
-            v.resize(sys.len().max(v.len()), 0.0);
-            median(&v).unwrap_or(0.0)
+            let v: Vec<f32> = p.samples.iter().map(f).collect();
+            median_with_zeros(&v, sys.len())
         };
         let cpu_typical = rec.processes.iter().map(|p| typical(p, |s| s.cpu)).collect();
         let io_typical = rec.processes.iter().map(|p| typical(p, |s| s.io)).collect();
@@ -101,7 +139,7 @@ impl<'a> Ctx<'a> {
         Self {
             rec,
             sys,
-            by_second,
+            at,
             cpu_typical,
             io_typical,
             cpu_perf_ref,
@@ -111,8 +149,9 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn proc_sample(&self, p: usize, sys_index: usize) -> Option<&crate::model::ProcSample> {
-        let i = *self.by_second[p].get(&second(self.sys[sys_index].t))?;
-        self.rec.processes[p].samples.get(i)
+        let at = &self.at[p];
+        let k = at.binary_search_by_key(&sys_index, |x| x.0).ok()?;
+        self.rec.processes[p].samples.get(at[k].1)
     }
 
     pub fn candidates(&self) -> Vec<Cand> {
@@ -131,16 +170,22 @@ impl<'a> Ctx<'a> {
         self.io_typical[p]
     }
 
+    /// Whether a process sample counts as a burst for a per-process candidate.
+    fn proc_active(&self, c: Cand, x: &ProcSample) -> bool {
+        match c {
+            Cand::AppCpu(p) => x.cpu >= (self.cpu_typical[p] + 5.0).max(8.0),
+            Cand::AppIo(p) => x.io >= (self.io_typical[p] * 3.0).max(20_000_000.0),
+            Cand::AppNet(_) => x.net_in >= 12.0 * self.bytes_per_mbit || x.net_out >= 3.0 * self.bytes_per_mbit,
+            _ => false,
+        }
+    }
+
     pub fn active(&self, c: Cand, i: usize) -> bool {
         let s = &self.sys[i];
         match c {
-            Cand::AppCpu(p) => self.proc_sample(p, i).is_some_and(|x| x.cpu >= (self.cpu_typical[p] + 5.0).max(8.0)),
-            Cand::AppIo(p) => {
-                self.proc_sample(p, i).is_some_and(|x| x.io >= (self.io_typical[p] * 3.0).max(20_000_000.0))
+            Cand::AppCpu(p) | Cand::AppIo(p) | Cand::AppNet(p) => {
+                self.proc_sample(p, i).is_some_and(|x| self.proc_active(c, x))
             }
-            Cand::AppNet(p) => self
-                .proc_sample(p, i)
-                .is_some_and(|x| x.net_in >= 12.0 * self.bytes_per_mbit || x.net_out >= 3.0 * self.bytes_per_mbit),
             Cand::CpuMaxed => match s.cpu {
                 Some(cpu) => cpu >= 95.0 && cpu - s.game_cpu.unwrap_or(0.0) >= 20.0,
                 None => false,
@@ -151,7 +196,8 @@ impl<'a> Ctx<'a> {
             },
             Cand::RamFull => {
                 let total = self.rec.machine.mem_total_mb.unwrap_or(0.0);
-                s.hard_faults.is_some_and(|f| f >= 250.0) || (total > 2_000.0 && s.mem_free_mb.is_some_and(|m| m < 400.0))
+                s.hard_faults.is_some_and(|f| f >= 250.0)
+                    || (total > 2_000.0 && s.mem_free_mb.is_some_and(|m| m < 400.0))
             }
             Cand::VramFull => match (s.vram_used_mb, self.rec.machine.vram_total_mb) {
                 (Some(used), Some(total)) if total > 0.0 => used / total >= 0.97,
@@ -172,20 +218,29 @@ impl<'a> Ctx<'a> {
     /// which seconds count at all.
     pub fn stats(&self, cands: &[Cand], incident: &[bool], eligible: &[bool]) -> HashMap<Cand, CandStat> {
         let mut out: HashMap<Cand, CandStat> = HashMap::new();
+        let n = self.sys.len().min(incident.len()).min(eligible.len());
+        let incident_secs = (0..n).filter(|&i| eligible[i] && incident[i]).count() as u32;
+        let base_secs = (0..n).filter(|&i| eligible[i] && !incident[i]).count() as u32;
         for &c in cands {
-            let mut st = CandStat::default();
-            for i in 0..self.sys.len() {
-                if !eligible[i] {
-                    continue;
+            let mut st = CandStat { incident_secs, base_secs, ..Default::default() };
+            let mut tally = |i: usize, on: bool| {
+                if on && i < n && eligible[i] {
+                    if incident[i] {
+                        st.hits += 1;
+                    } else {
+                        st.base_hits += 1;
+                    }
                 }
-                let on = self.active(c, i);
-                if incident[i] {
-                    st.incident_secs += 1;
-                    st.hits += on as u32;
-                } else {
-                    st.base_secs += 1;
-                    st.base_hits += on as u32;
+            };
+            match c {
+                // A process can only be active in seconds it was recorded, so only visit those.
+                Cand::AppCpu(p) | Cand::AppIo(p) | Cand::AppNet(p) => {
+                    let samples = &self.rec.processes[p].samples;
+                    for &(i, j) in &self.at[p] {
+                        tally(i, self.proc_active(c, &samples[j]));
+                    }
                 }
+                _ => (0..n).for_each(|i| tally(i, self.active(c, i))),
             }
             if st.hits > 0 {
                 out.insert(c, st);
@@ -196,7 +251,13 @@ impl<'a> Ctx<'a> {
 }
 
 /// The best explanation among the causes active during `[a, b]`, if any stands out.
-pub fn best_cause(ctx: &Ctx, stats: &HashMap<Cand, CandStat>, a: f64, b: f64, stutter: bool) -> Option<(Cand, CandStat)> {
+pub fn best_cause(
+    ctx: &Ctx,
+    stats: &HashMap<Cand, CandStat>,
+    a: f64,
+    b: f64,
+    stutter: bool,
+) -> Option<(Cand, CandStat)> {
     let range = ctx.covering(a, b);
     let mut best: Option<(Cand, CandStat, f32)> = None;
     for (&c, st) in stats {
@@ -209,7 +270,8 @@ pub fn best_cause(ctx: &Ctx, stats: &HashMap<Cand, CandStat>, a: f64, b: f64, st
         }
         let lift = st.lift();
         // Few incidents means weak statistics: then only blame causes that are rarely active.
-        let enough = if st.incident_secs >= 3 { st.hits >= 2 && lift >= 1.5 } else { st.base_rate() <= 0.25 && lift >= 1.5 };
+        let enough =
+            if st.incident_secs >= 3 { st.hits >= 2 && lift >= 1.5 } else { st.base_rate() <= 0.25 && lift >= 1.5 };
         if !enough {
             continue;
         }
@@ -222,13 +284,16 @@ pub fn best_cause(ctx: &Ctx, stats: &HashMap<Cand, CandStat>, a: f64, b: f64, st
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::model::{ProcSample, ProcessTrack};
 
     fn rec_with(proc_cpu: impl Fn(usize) -> f32, n: usize) -> Recording {
         let mut rec = Recording::default();
-        rec.system = (1..=n).map(|s| SystemSample { t: s as f64 * 1000.0, cpu: Some(40.0), foreground: true, ..Default::default() }).collect();
+        rec.system = (1..=n)
+            .map(|s| SystemSample { t: s as f64 * 1000.0, cpu: Some(40.0), foreground: true, ..Default::default() })
+            .collect();
         rec.processes.push(ProcessTrack {
             key: "msmpeng.exe".into(),
             label: "Microsoft Defender".into(),
@@ -239,6 +304,27 @@ mod tests {
                 .collect(),
         });
         rec
+    }
+
+    #[test]
+    fn zero_padded_median() {
+        assert_eq!(median_with_zeros(&[5.0, 9.0], 10), 0.0);
+        assert_eq!(median_with_zeros(&[5.0, 9.0, 7.0], 4), 6.0);
+        assert_eq!(median_with_zeros(&[5.0, 9.0, 7.0], 3), 7.0);
+        assert_eq!(median_with_zeros(&[], 0), 0.0);
+    }
+
+    #[test]
+    fn process_samples_find_their_second() {
+        let mut rec = rec_with(|s| if s == 3 { 20.0 } else { 0.0 }, 5);
+        // Ticks drift in real recordings; a sample still lands on its own second.
+        for (i, s) in rec.system.iter_mut().enumerate() {
+            s.t += i as f64 * 37.0;
+        }
+        rec.processes[0].samples[0].t = rec.system[2].t;
+        let ctx = Ctx::new(&rec);
+        assert_eq!(ctx.proc_sample(0, 2).map(|s| s.cpu), Some(20.0));
+        assert!(ctx.proc_sample(0, 1).is_none());
     }
 
     #[test]

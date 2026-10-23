@@ -45,7 +45,7 @@ pub fn isp_hop(hops: &[Option<IpAddr>]) -> Option<IpAddr> {
 
 /// The last hop that answered before the destination, for servers that ignore pings.
 pub fn last_answering_hop(hops: &[Option<IpAddr>], destination: &IpAddr) -> Option<IpAddr> {
-    hops.iter().flatten().filter(|ip| *ip != destination && !is_local(ip)).last().copied()
+    hops.iter().rev().flatten().find(|ip| *ip != destination && !is_local(ip)).copied()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -83,7 +83,8 @@ pub fn pick_server(flows: &[Flow], seconds: f64, allow_local: bool) -> Option<Fl
             && f.packets_out as f64 / seconds >= 2.0
     };
     let rate = |f: &Flow| (f.packets_in + f.packets_out) as f64;
-    let best_udp = flows.iter().filter(eligible).filter(|f| f.proto == Proto::Udp).max_by(|a, b| rate(a).total_cmp(&rate(b)));
+    let best_udp =
+        flows.iter().filter(eligible).filter(|f| f.proto == Proto::Udp).max_by(|a, b| rate(a).total_cmp(&rate(b)));
     if let Some(f) = best_udp {
         return Some(*f);
     }
@@ -121,7 +122,8 @@ mod tests {
 
     #[test]
     fn finds_isp_hop_past_double_nat() {
-        let hops = vec![Some(ip("192.168.1.1")), Some(ip("192.168.0.1")), None, Some(ip("100.64.12.1")), Some(ip("80.1.2.3"))];
+        let hops =
+            vec![Some(ip("192.168.1.1")), Some(ip("192.168.0.1")), None, Some(ip("100.64.12.1")), Some(ip("80.1.2.3"))];
         assert_eq!(isp_hop(&hops), Some(ip("100.64.12.1")));
         assert_eq!(last_answering_hop(&hops, &ip("155.133.1.1")), Some(ip("80.1.2.3")));
         assert_eq!(isp_hop(&[Some(ip("192.168.1.1"))]), None);

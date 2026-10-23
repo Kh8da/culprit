@@ -2,6 +2,7 @@
 
 use crate::model::{Ping, Recording, SystemSample, TargetRole};
 use crate::stats::{percentile, RollingMedian};
+use std::collections::HashMap;
 
 /// A frame longer than this is a pause (loading screen, alt-tab, breakpoint), not a stutter.
 const PAUSE_MS: f32 = 2_000.0;
@@ -32,29 +33,51 @@ pub struct FrameStats {
     pub minutes: f32,
 }
 
-/// Whether the game was in front at time `t`. With no system samples, assume it was.
-pub fn foreground_at(system: &[SystemSample], t: f64) -> bool {
-    if system.is_empty() {
-        return true;
+/// Answers "was the game in front at time `t`" for times that only move forward.
+///
+/// A frame only counts when the game was in front for both the second it landed in and
+/// the second before, so the first frames after alt-tabbing back in (which often carry the
+/// slow background frame rate) aren't mistaken for stutters.
+struct Foreground<'a> {
+    system: &'a [SystemSample],
+    next: usize,
+}
+
+impl<'a> Foreground<'a> {
+    fn new(system: &'a [SystemSample]) -> Self {
+        Self { system, next: 0 }
     }
-    // A sample stamped `t` covers the second before it, so the first sample at or after `t`.
-    let i = system.partition_point(|s| s.t < t);
-    system.get(i).or(system.last()).map(|s| s.foreground).unwrap_or(true)
+
+    fn settled(&mut self, t: f64) -> bool {
+        let sys = self.system;
+        let Some(last) = sys.last() else { return true };
+        // A sample stamped `t` covers the second before it, so the first sample at or after `t`.
+        while self.next < sys.len() && sys[self.next].t < t {
+            self.next += 1;
+        }
+        if self.next == sys.len() {
+            return last.foreground;
+        }
+        let now = sys[self.next].foreground;
+        let before = self.next.checked_sub(1).map_or(now, |i| sys[i].foreground);
+        now && before
+    }
 }
 
 /// A frame is a stutter when it takes much longer than the frames just before it and the
 /// difference is big enough to feel: at least 2.5 times as long, 12 ms longer, and 25 ms.
 pub fn is_stutter(ms: f32, normal: f32) -> bool {
-    ms >= normal * 2.5 && ms - normal >= 12.0 && ms >= 25.0 && ms < PAUSE_MS
+    ms >= normal * 2.5 && ms - normal >= 12.0 && (25.0..PAUSE_MS).contains(&ms)
 }
 
 pub fn find_stutters(rec: &Recording) -> (Vec<Stutter>, FrameStats) {
     let mut baseline = RollingMedian::new(90);
+    let mut fg = Foreground::new(&rec.system);
     let mut out: Vec<Stutter> = Vec::new();
     let mut counted: Vec<f32> = Vec::new();
     let mut played_ms = 0.0f64;
     for (i, f) in rec.frames.iter().enumerate() {
-        if f.ms >= PAUSE_MS || !foreground_at(&rec.system, f.t) {
+        if !f.ms.is_finite() || f.ms >= PAUSE_MS || !fg.settled(f.t) {
             continue;
         }
         let normal = baseline.median();
@@ -94,12 +117,13 @@ pub fn find_stutters(rec: &Recording) -> (Vec<Stutter>, FrameStats) {
     let stats = if counted.is_empty() || played_ms <= 0.0 {
         FrameStats::default()
     } else {
+        let worst = counted.iter().copied().fold(0.0, f32::max);
         let p99 = percentile(&counted, 99.0).unwrap_or(0.0).max(0.001);
         FrameStats {
             frames: counted.len() as u32,
             avg_fps: (counted.len() as f64 / (played_ms / 1000.0)) as f32,
             low1_fps: 1000.0 / p99,
-            worst_ms: counted.iter().copied().fold(0.0, f32::max),
+            worst_ms: worst,
             minutes: (played_ms / 60_000.0) as f32,
         }
     };
@@ -140,11 +164,12 @@ impl Lag {
 /// A target's ping history split into what's normal and what isn't.
 pub struct PingTrack {
     pub target: u32,
+    pub role: TargetRole,
     /// Answered pings out of all sent.
     pub answer_rate: f32,
     /// The typical round trip.
     pub normal: Option<f32>,
-    /// Pings that were spikes or losses, with the normal value at that moment.
+    /// Pings that were spikes or losses, oldest first, with the normal value at that moment.
     pub bad: Vec<(Ping, f32)>,
 }
 
@@ -155,7 +180,8 @@ impl PingTrack {
     }
 
     pub fn bad_between(&self, a: f64, b: f64) -> impl Iterator<Item = &(Ping, f32)> {
-        self.bad.iter().filter(move |(p, _)| p.t >= a && p.t <= b)
+        let from = self.bad.partition_point(|(p, _)| p.t < a);
+        self.bad[from..].iter().take_while(move |(p, _)| p.t <= b)
     }
 }
 
@@ -164,58 +190,70 @@ pub fn spike_threshold(normal: f32) -> f32 {
     normal + (normal * 0.8).max(25.0)
 }
 
-pub fn track_pings(rec: &Recording, target: u32) -> PingTrack {
-    let pings: Vec<Ping> = rec.pings.iter().filter(|p| p.target == target).copied().collect();
-    let answered = pings.iter().filter(|p| p.rtt.is_some()).count();
-    let answer_rate = if pings.is_empty() { 0.0 } else { answered as f32 / pings.len() as f32 };
+/// Every target's ping history, worked out in one pass over the pings.
+pub fn track_all(rec: &Recording) -> Vec<PingTrack> {
+    let mut by_target: HashMap<u32, Vec<Ping>> = HashMap::new();
+    for p in &rec.pings {
+        by_target.entry(p.target).or_default().push(*p);
+    }
+    rec.targets
+        .iter()
+        .map(|t| {
+            let mut pings = by_target.remove(&t.id).unwrap_or_default();
+            pings.sort_by(|a, b| a.t.total_cmp(&b.t));
+            track(t.id, t.role, &pings)
+        })
+        .collect()
+}
+
+fn track(target: u32, role: TargetRole, pings: &[Ping]) -> PingTrack {
     let all: Vec<f32> = pings.iter().filter_map(|p| p.rtt).collect();
+    let answer_rate = if pings.is_empty() { 0.0 } else { all.len() as f32 / pings.len() as f32 };
     let normal = crate::stats::median(&all);
     let mut rolling = RollingMedian::new(40);
     let mut bad = Vec::new();
-    for p in &pings {
+    for p in pings {
         let local = if rolling.len() >= 8 { rolling.median() } else { None };
         let reference = local.or(normal);
         match (p.rtt, reference) {
             (Some(rtt), Some(n)) if rtt > spike_threshold(n) => bad.push((*p, n)),
             (Some(rtt), _) => rolling.push(rtt),
-            (None, Some(n)) if answered > 0 => bad.push((*p, n)),
-            _ => {}
+            (None, Some(n)) => bad.push((*p, n)),
+            (None, None) => {}
         }
     }
-    PingTrack { target, answer_rate, normal, bad }
+    PingTrack { target, role, answer_rate, normal, bad }
 }
 
-/// The targets that stand for "the way to the game": the server when it answers pings,
+/// The tracks that stand for "the way to the game": the server when it answers pings,
 /// otherwise the last hop before it.
-pub fn path_targets(rec: &Recording) -> Vec<u32> {
-    let servers: Vec<u32> = rec
-        .targets
-        .iter()
-        .filter(|t| t.role == TargetRole::Server)
-        .map(|t| t.id)
-        .filter(|&id| track_pings(rec, id).trustworthy())
-        .collect();
-    if !servers.is_empty() {
-        return servers;
+pub fn path_tracks(tracks: &[PingTrack]) -> Vec<&PingTrack> {
+    let pick =
+        |role: TargetRole| -> Vec<&PingTrack> { tracks.iter().filter(|t| t.role == role && t.trustworthy()).collect() };
+    let servers = pick(TargetRole::Server);
+    if servers.is_empty() {
+        pick(TargetRole::ServerPath)
+    } else {
+        servers
     }
-    rec.targets
-        .iter()
-        .filter(|t| t.role == TargetRole::ServerPath)
-        .map(|t| t.id)
-        .filter(|&id| track_pings(rec, id).trustworthy())
-        .collect()
 }
 
-pub fn find_lag(rec: &Recording) -> Vec<Lag> {
+pub fn find_lag(rec: &Recording, tracks: &[PingTrack]) -> Vec<Lag> {
     let mut events: Vec<Lag> = Vec::new();
 
-    for id in path_targets(rec) {
-        let track = track_pings(rec, id);
+    for track in path_tracks(tracks) {
         // One stray slow or lost ping is noise (routers deprioritise pings); two within
         // two seconds, or one very slow one, is lag.
         let bad = &track.bad;
+        let (mut lo, mut hi) = (0, 0);
         for (p, normal) in bad {
-            let neighbours = bad.iter().filter(|(q, _)| (q.t - p.t).abs() <= 2_000.0).count();
+            while bad[lo].0.t < p.t - 2_000.0 {
+                lo += 1;
+            }
+            while hi < bad.len() && bad[hi].0.t <= p.t + 2_000.0 {
+                hi += 1;
+            }
+            let neighbours = hi - lo;
             let big = p.rtt.is_some_and(|r| r > normal + normal.max(40.0));
             if neighbours < 2 && !big {
                 continue;
@@ -241,8 +279,13 @@ pub fn find_lag(rec: &Recording) -> Vec<Lag> {
                 i += 1;
             }
             let ms = ((i - start) * 100) as f32;
+            // Lag ends with the stream coming back at its usual rate. When it comes back much
+            // slower, the game changed state (match over, back in a menu) instead.
+            let after = &bins[i..(i + 10).min(bins.len())];
+            let resumed = !after.is_empty()
+                && after.iter().map(|b| b.packets_in as f32).sum::<f32>() / after.len() as f32 >= normal * 0.5;
             // Short gaps are normal jitter; very long ones are a map change or disconnect.
-            if (300.0..=5_000.0).contains(&ms) && i < bins.len() {
+            if (300.0..=5_000.0).contains(&ms) && resumed {
                 let t = start as f64 * 100.0;
                 events.push(Lag { t, end: t + ms as f64, signs: vec![LagSign::Silence { ms }] });
             }
@@ -261,8 +304,12 @@ pub fn find_lag(rec: &Recording) -> Vec<Lag> {
                 for s in e.signs {
                     match (&s, m.signs.iter_mut().find(|x| std::mem::discriminant(*x) == std::mem::discriminant(&s))) {
                         (LagSign::Loss { lost }, Some(LagSign::Loss { lost: total })) => *total += lost,
-                        (LagSign::Spike { rtt, .. }, Some(LagSign::Spike { rtt: worst, .. })) => *worst = worst.max(*rtt),
-                        (LagSign::Silence { ms }, Some(LagSign::Silence { ms: longest })) => *longest = longest.max(*ms),
+                        (LagSign::Spike { rtt, .. }, Some(LagSign::Spike { rtt: worst, .. })) => {
+                            *worst = worst.max(*rtt)
+                        }
+                        (LagSign::Silence { ms }, Some(LagSign::Silence { ms: longest })) => {
+                            *longest = longest.max(*ms)
+                        }
                         _ => m.signs.push(s),
                     }
                 }
@@ -274,6 +321,7 @@ pub fn find_lag(rec: &Recording) -> Vec<Lag> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::model::{Frame, Target, TrafficBin};
@@ -323,13 +371,26 @@ mod tests {
         let mut rec = Recording::default();
         rec.frames = frames(|i| if i == 400 { 100.0 } else { 16.7 }, 600);
         let t = rec.frames[400].t;
-        rec.system = (1..=11).map(|s| SystemSample { t: s as f64 * 1000.0, foreground: (s as f64 * 1000.0) < t || (s as f64 * 1000.0) > t + 1000.0, ..Default::default() }).collect();
+        rec.system = (1..=11)
+            .map(|s| SystemSample {
+                t: s as f64 * 1000.0,
+                foreground: (s as f64 * 1000.0) < t || (s as f64 * 1000.0) > t + 1000.0,
+                ..Default::default()
+            })
+            .collect();
         assert!(find_stutters(&rec).0.is_empty());
     }
 
     fn pinged(rtts: &[Option<f32>]) -> Recording {
         let mut rec = Recording::default();
-        rec.targets.push(Target { id: 1, role: TargetRole::Server, ip: "1.2.3.4".into(), host: None, since: 0.0, until: None });
+        rec.targets.push(Target {
+            id: 1,
+            role: TargetRole::Server,
+            ip: "1.2.3.4".into(),
+            host: None,
+            since: 0.0,
+            until: None,
+        });
         rec.pings = rtts.iter().enumerate().map(|(i, &rtt)| Ping { target: 1, t: i as f64 * 250.0, rtt }).collect();
         rec
     }
@@ -342,7 +403,8 @@ mod tests {
         rtts[150] = None; // two losses close together: lag
         rtts[152] = None;
         rtts[190] = None; // single loss: noise
-        let lag = find_lag(&pinged(&rtts));
+        let rec = pinged(&rtts);
+        let lag = find_lag(&rec, &track_all(&rec));
         assert_eq!(lag.len(), 2, "{lag:?}");
         assert_eq!(lag[0].signs, vec![LagSign::Spike { rtt: 260.0, normal: 31.5 }]);
         assert_eq!(lag[1].signs, vec![LagSign::Loss { lost: 2 }]);
@@ -351,17 +413,21 @@ mod tests {
     #[test]
     fn unpingable_server_is_not_lag() {
         let rec = pinged(&vec![None; 100]);
-        assert!(path_targets(&rec).is_empty());
-        assert!(find_lag(&rec).is_empty());
+        let tracks = track_all(&rec);
+        assert!(path_tracks(&tracks).is_empty());
+        assert!(find_lag(&rec, &tracks).is_empty());
     }
 
     #[test]
     fn traffic_silence() {
         let mut rec = Recording::default();
         rec.game_traffic = (0..300)
-            .map(|i| TrafficBin { packets_in: if (100..108).contains(&i) || (200..201).contains(&i) { 0 } else { 6 }, ..Default::default() })
+            .map(|i| TrafficBin {
+                packets_in: if (100..108).contains(&i) || (200..201).contains(&i) { 0 } else { 6 },
+                ..Default::default()
+            })
             .collect();
-        let lag = find_lag(&rec);
+        let lag = find_lag(&rec, &track_all(&rec));
         assert_eq!(lag.len(), 1);
         assert_eq!(lag[0].signs, vec![LagSign::Silence { ms: 800.0 }]);
         assert_eq!(lag[0].t, 10_000.0);

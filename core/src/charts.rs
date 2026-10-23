@@ -88,7 +88,14 @@ mod tests {
             Frame { t: 50.0, ms: 30.0, ..Default::default() },
             Frame { t: 150.0, ms: 16.0, ..Default::default() },
         ];
-        rec.targets.push(Target { id: 3, role: TargetRole::Router, ip: "192.168.1.1".into(), host: None, since: 0.0, until: None });
+        rec.targets.push(Target {
+            id: 3,
+            role: TargetRole::Router,
+            ip: "192.168.1.1".into(),
+            host: None,
+            since: 0.0,
+            until: None,
+        });
         rec.pings = vec![
             Ping { target: 3, t: 0.0, rtt: Some(2.0) },
             Ping { target: 3, t: 60.0, rtt: Some(9.0) },

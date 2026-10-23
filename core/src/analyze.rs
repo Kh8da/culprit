@@ -13,21 +13,30 @@ const MARK_AFTER_MS: f64 = 1_000.0;
 
 pub fn analyze(rec: &Recording) -> Report {
     let (stutters, fstats) = find_stutters(rec);
-    let lags = find_lag(rec);
+    let tracks = detect::track_all(rec);
+    let lags = find_lag(rec, &tracks);
     let ctx = Ctx::new(rec);
-    let net = NetTracks::new(rec);
+    let net = NetTracks::new(&tracks);
 
     let game_since = rec.game.as_ref().map(|g| g.since).unwrap_or(0.0);
     let last_frame = rec.frames.last().map(|f| f.t);
     let sys = &rec.system;
-    let overlaps = |i: usize, a: f64, b: f64| sys[i].t > a && sys[i].t - 1000.0 < b;
-
-    let st_eligible: Vec<bool> = (0..sys.len())
-        .map(|i| sys[i].foreground && sys[i].t - 1000.0 >= game_since && last_frame.is_some_and(|l| sys[i].t <= l + 1000.0))
+    let st_eligible: Vec<bool> = sys
+        .iter()
+        .map(|s| s.foreground && s.t - 1000.0 >= game_since && last_frame.is_some_and(|l| s.t <= l + 1000.0))
         .collect();
-    let st_secs: Vec<bool> = (0..sys.len()).map(|i| stutters.iter().any(|s| overlaps(i, s.t - 300.0, s.end))).collect();
-    let lag_eligible: Vec<bool> = (0..sys.len()).map(|i| sys[i].t - 1000.0 >= game_since).collect();
-    let lag_secs: Vec<bool> = (0..sys.len()).map(|i| lags.iter().any(|l| overlaps(i, l.t - 1000.0, l.end + 500.0))).collect();
+    let lag_eligible: Vec<bool> = sys.iter().map(|s| s.t - 1000.0 >= game_since).collect();
+    let mark = |windows: &mut dyn Iterator<Item = (f64, f64)>| {
+        let mut secs = vec![false; sys.len()];
+        for (a, b) in windows {
+            for i in ctx.covering(a, b) {
+                secs[i] = true;
+            }
+        }
+        secs
+    };
+    let st_secs = mark(&mut stutters.iter().map(|s| (s.t - 300.0, s.end)));
+    let lag_secs = mark(&mut lags.iter().map(|l| (l.t - 1000.0, l.end + 500.0)));
 
     let cands = ctx.candidates();
     let st_cands: Vec<Cand> = cands.iter().copied().filter(|c| c.for_stutters()).collect();
@@ -61,11 +70,12 @@ pub fn analyze(rec: &Recording) -> Report {
     if let Some(n) = &net_summary {
         if n.server.is_some() && !n.server_answers_ping {
             notes.push(
-                "The game server doesn't answer pings, so its ping was measured at the last stop on the way to it.".into(),
+                "The game server doesn't answer pings, so its ping was measured at the last stop on the way to it."
+                    .into(),
             );
         }
     }
-    if rec.targets.iter().any(|t| t.role == TargetRole::Router) && !net.router.iter().any(PingTrack::trustworthy) {
+    if !net.router.is_empty() && !net.router.iter().any(|t| t.trustworthy()) {
         notes.push("Your router doesn't answer pings reliably, so Culprit couldn't check the link to it.".into());
     }
 
@@ -201,7 +211,9 @@ fn cand_evidence(ctx: &Ctx, c: Cand, range: std::ops::Range<usize>) -> String {
             let free = range.clone().filter_map(|i| ctx.sys[i].mem_free_mb).fold(f32::NAN, f32::min);
             let faults = max_of(&|i| ctx.sys[i].hard_faults);
             match (free.is_finite(), faults.is_finite()) {
-                (true, true) => format!("Only {free:.0} MB of RAM was free, and Windows read {faults:.0} pages per second back from disk."),
+                (true, true) => format!(
+                    "Only {free:.0} MB of RAM was free, and Windows read {faults:.0} pages per second back from disk."
+                ),
                 (true, false) => format!("Only {free:.0} MB of RAM was free."),
                 _ => format!("Windows read {faults:.0} pages per second back from disk because RAM ran short."),
             }
@@ -301,33 +313,28 @@ fn game_cause(ctx: &Ctx, s: &Stutter, range: std::ops::Range<usize>) -> (Cause, 
 
 /* ---------- network ---------- */
 
-pub struct NetTracks {
-    pub router: Vec<PingTrack>,
-    pub isp: Vec<PingTrack>,
-    pub path: Vec<PingTrack>,
+pub struct NetTracks<'a> {
+    pub router: Vec<&'a PingTrack>,
+    pub isp: Vec<&'a PingTrack>,
+    pub path: Vec<&'a PingTrack>,
     pub path_is_server: bool,
 }
 
-impl NetTracks {
-    fn new(rec: &Recording) -> Self {
-        let by_role = |role: TargetRole| -> Vec<PingTrack> {
-            rec.targets.iter().filter(|t| t.role == role).map(|t| detect::track_pings(rec, t.id)).collect()
-        };
-        let path_ids = detect::path_targets(rec);
-        let path_is_server = path_ids
-            .first()
-            .is_some_and(|id| rec.targets.iter().any(|t| t.id == *id && t.role == TargetRole::Server));
+impl<'a> NetTracks<'a> {
+    fn new(tracks: &'a [PingTrack]) -> Self {
+        let by_role = |role: TargetRole| tracks.iter().filter(|t| t.role == role).collect::<Vec<_>>();
+        let path = detect::path_tracks(tracks);
         Self {
             router: by_role(TargetRole::Router),
             isp: by_role(TargetRole::Isp),
-            path: path_ids.into_iter().map(|id| detect::track_pings(rec, id)).collect(),
-            path_is_server,
+            path_is_server: path.first().is_some_and(|t| t.role == TargetRole::Server),
+            path,
         }
     }
 }
 
 /// What a group of ping tracks saw in `[a, b]`: `Some(text)` if something was wrong.
-fn trouble(tracks: &[PingTrack], a: f64, b: f64, name: &str) -> Option<String> {
+fn trouble(tracks: &[&PingTrack], a: f64, b: f64, name: &str) -> Option<String> {
     for t in tracks.iter().filter(|t| t.trustworthy()) {
         let bad: Vec<_> = t.bad_between(a, b).collect();
         if bad.is_empty() {
@@ -337,7 +344,12 @@ fn trouble(tracks: &[PingTrack], a: f64, b: f64, name: &str) -> Option<String> {
         let worst = bad.iter().filter_map(|(p, _)| p.rtt).fold(f32::NAN, f32::max);
         let normal = t.normal.unwrap_or(0.0);
         return Some(if worst.is_finite() && lost > 0 {
-            format!("{name} took {} to answer and missed {} (normally {}).", ms(worst), plural(lost, "ping", "pings"), ms(normal))
+            format!(
+                "{name} took {} to answer and missed {} (normally {}).",
+                ms(worst),
+                plural(lost, "ping", "pings"),
+                ms(normal)
+            )
         } else if worst.is_finite() {
             format!("{name} took {} to answer (normally {}).", ms(worst), ms(normal))
         } else {
@@ -347,7 +359,7 @@ fn trouble(tracks: &[PingTrack], a: f64, b: f64, name: &str) -> Option<String> {
     None
 }
 
-fn fine(tracks: &[PingTrack], name: &str) -> Option<String> {
+fn fine(tracks: &[&PingTrack], name: &str) -> Option<String> {
     tracks
         .iter()
         .find(|t| t.trustworthy())
@@ -359,7 +371,9 @@ fn lag_what(l: &Lag, server_word: &str) -> String {
         .signs
         .iter()
         .map(|s| match s {
-            LagSign::Spike { rtt, normal } => format!("Ping to the {server_word} jumped to {} (normally {})", ms(*rtt), ms(*normal)),
+            LagSign::Spike { rtt, normal } => {
+                format!("Ping to the {server_word} jumped to {} (normally {})", ms(*rtt), ms(*normal))
+            }
             LagSign::Loss { lost } => format!("{} to the {server_word} got no answer", plural(*lost, "ping", "pings")),
             LagSign::Silence { ms: gap } => format!("No data from the server for {}", ms(*gap)),
         })
@@ -446,14 +460,20 @@ fn apply_marks(
         // Nothing crossed the thresholds, so report what was worst in the seconds before.
         let (a, b) = (m - 5_000.0, m);
         let mut evidence = Vec::new();
-        let worst = rec.frames.iter().filter(|f| f.t >= a && f.t <= b).map(|f| f.ms).fold(f32::NAN, f32::max);
+        let from = rec.frames.partition_point(|f| f.t < a);
+        let worst = rec.frames[from..].iter().take_while(|f| f.t <= b).map(|f| f.ms).fold(f32::NAN, f32::max);
         if worst.is_finite() && fstats.avg_fps > 0.0 {
-            evidence.push(format!("The slowest frame in the 5 seconds before took {} (you average {:.0} fps).", ms(worst), fstats.avg_fps));
+            evidence.push(format!(
+                "The slowest frame in the 5 seconds before took {} (you average {:.0} fps).",
+                ms(worst),
+                fstats.avg_fps
+            ));
         }
-        let path_worst = net
-            .path
+        let from = rec.pings.partition_point(|p| p.t < a);
+        let path_worst = rec.pings[from..]
             .iter()
-            .flat_map(|t| ctx.rec.pings.iter().filter(move |p| p.target == t.target && p.t >= a && p.t <= b))
+            .take_while(|p| p.t <= b)
+            .filter(|p| net.path.iter().any(|t| t.target == p.target))
             .filter_map(|p| p.rtt)
             .fold(f32::NAN, f32::max);
         if path_worst.is_finite() {
@@ -534,11 +554,22 @@ fn culprits(
                         .filter(|i| ctx.covering(i.t - 1000.0, i.t + i.dur + 300.0).any(|s| ctx.active(c, s)))
                         .count();
                     let base = stats.get(&c).map(|s| s.base_rate()).unwrap_or(0.0);
-                    format!(
-                        "It was busy during {during} of {of} {}, but only {:.0}% of the rest of the time.",
-                        noun(kind).1,
-                        base * 100.0
-                    )
+                    let otherwise = if base < 0.005 {
+                        "and almost never otherwise".to_string()
+                    } else {
+                        format!("and only {:.0}% of the rest of the time", base * 100.0)
+                    };
+                    let doing = match &cause {
+                        Cause::App { label, .. } => format!("{label} was in a CPU burst"),
+                        Cause::AppDisk { label, .. } => format!("{label} was hammering the disk"),
+                        Cause::AppNetwork { label, .. } => format!("{label} was using your connection heavily"),
+                        Cause::CpuMaxed => "Your CPU was maxed out".into(),
+                        Cause::CpuSlowed => "Your CPU was running slow".into(),
+                        Cause::RamFull => "RAM was nearly full".into(),
+                        Cause::VramFull => "GPU memory was full".into(),
+                        _ => "The GPU was throttling".into(),
+                    };
+                    format!("{doing} during {during} of {of} {}, {otherwise}.", noun(kind).1)
                 }
                 None => match &cause {
                     Cause::HomeNetwork { .. } => {
@@ -556,7 +587,7 @@ fn culprits(
             };
             let times: Vec<f64> = list.iter().map(|i| i.t).collect();
             if let Some(every) = regular_interval(&times, 0.12) {
-                why.push_str(&format!(" It happened like clockwork, about every {:.0} seconds.", every / 1000.0));
+                why.push_str(&format!(" It came back about every {:.0} seconds, which points to something on a timer.", every / 1000.0));
             }
             let mut fix = fix_for(&cause);
             if matches!(cause, Cause::HomeNetwork { wifi: true }) && regular_interval(&times, 0.12).is_some() {
@@ -581,25 +612,25 @@ fn fix_for(cause: &Cause) -> String {
     };
     let specific = match key {
         "msmpeng.exe" | "mpdefendercoreservice.exe" | "svc:windefend" => Some(
-            "A Microsoft Defender scan ran while you played. Windows normally waits for idle time, so if scans keep landing mid-game, give the \"Windows Defender Scheduled Scan\" task a fixed time in Task Scheduler (Microsoft › Windows › Windows Defender).",
+            "A Microsoft Defender scan ran while you played. Windows normally waits for idle time, so if scans keep landing mid-game, give the \"Windows Defender Scheduled Scan\" task a fixed time in Task Scheduler (Microsoft > Windows > Windows Defender).",
         ),
         "tiworker.exe" | "trustedinstaller.exe" | "svc:wuauserv" | "svc:usosvc" | "svc:trustedinstaller" | "mousocoreworker.exe" => Some(
-            "Windows Update was working in the background. Pause updates while you play (Settings › Windows Update › Pause updates), or set your active hours so it waits.",
+            "Windows Update was working in the background. Pause updates while you play (Settings > Windows Update > Pause updates), or set your active hours so it waits.",
         ),
         "svc:dosvc" | "svc:bits" => Some(
-            "Windows was downloading updates. Limit it in Settings › Windows Update › Advanced options › Delivery Optimization › Advanced options, or pause updates while you play.",
+            "Windows was downloading updates. Limit it in Settings > Windows Update > Advanced options > Delivery Optimization > Advanced options, or pause updates while you play.",
         ),
         "searchindexer.exe" | "searchprotocolhost.exe" | "svc:wsearch" => Some(
-            "Windows Search was indexing files. Settings › Privacy & security › Searching Windows lets you switch to Classic or leave your game folders out.",
+            "Windows Search was indexing files. Settings > Privacy & security > Searching Windows lets you switch to Classic or leave your game folders out.",
         ),
         "steam.exe" | "steamservice.exe" | "steamwebhelper.exe" => Some(
-            "Steam was busy, usually downloading an update. In Steam › Settings › Downloads, turn off \"Allow downloads during gameplay\".",
+            "Steam was busy, usually downloading an update. In Steam > Settings > Downloads, turn off \"Allow downloads during gameplay\".",
         ),
         "onedrive.exe" | "dropbox.exe" | "googledrivefs.exe" => Some("Your cloud sync was busy. Pause syncing from its tray icon while you play."),
         "chrome.exe" | "msedge.exe" | "firefox.exe" | "opera.exe" | "opera_gx.exe" | "brave.exe" | "vivaldi.exe" => Some(
             "Your browser was busy. Close tabs that play video or refresh themselves, or close the browser while you play.",
         ),
-        "discord.exe" => Some("Discord was busy. Turning off hardware acceleration (Settings › Advanced) often calms it down while a game runs."),
+        "discord.exe" => Some("Discord was busy. Turning off hardware acceleration (Settings > Advanced) often calms it down while a game runs."),
         "obs64.exe" | "obs32.exe" => Some("OBS was competing with the game. Use your GPU's hardware encoder (NVENC, AMF or QuickSync) instead of x264."),
         "epicgameslauncher.exe" | "battle.net.exe" | "eadesktop.exe" | "upc.exe" | "riotclientservices.exe" | "xboxpcapp.exe" => Some(
             "A game launcher was busy, usually downloading an update. Pause downloads in it while you play.",
@@ -615,7 +646,7 @@ fn fix_for(cause: &Cause) -> String {
         Cause::AppDisk { label, .. } => format!("{label} kept the disk busy, so the game had to wait its turn. Pause it while you play, or move the game to another drive."),
         Cause::AppNetwork { label, .. } => format!("{label} was using your connection at the same time. Pause it while you play, or set a speed limit in it."),
         Cause::CpuMaxed => "Your CPU had no headroom left. Close what you don't need in the background, or lower the game's CPU-heavy settings (view distance, crowds, physics).".into(),
-        Cause::CpuSlowed => "Your CPU slowed itself down, usually because of heat or a power-saving mode. Plug in if it's a laptop, pick Best performance in Settings › System › Power, and check the cooler isn't full of dust.".into(),
+        Cause::CpuSlowed => "Your CPU slowed itself down, usually because of heat or a power-saving mode. Plug in if it's a laptop, pick Best performance in Settings > System > Power, and check the cooler isn't full of dust.".into(),
         Cause::RamFull => "Your PC ran out of free memory, so Windows swapped to disk. Close browsers and other big apps before you play.".into(),
         Cause::VramFull => "The game filled the GPU's memory. Lower texture quality by one step.".into(),
         Cause::GpuThrottled => "Your GPU held itself back because of heat or power limits. Clean the dust out of its fans and check the case gets fresh air.".into(),
@@ -637,16 +668,23 @@ fn net_summary(rec: &Recording, net: &NetTracks, lag_spikes: u32) -> Option<NetS
     if rec.pings.is_empty() && rec.servers.is_empty() && rec.game_traffic.is_empty() {
         return None;
     }
-    let path: Vec<f32> = net
-        .path
-        .iter()
-        .flat_map(|t| rec.pings.iter().filter(move |p| p.target == t.target))
-        .filter_map(|p| p.rtt)
-        .collect();
-    let jitter = mean(&path.windows(2).map(|w| (w[1] - w[0]).abs()).collect::<Vec<_>>());
-    let sent: usize = net.path.iter().map(|t| rec.pings.iter().filter(|p| p.target == t.target).count()).sum();
-    let lost: usize = net.path.iter().map(|t| rec.pings.iter().filter(|p| p.target == t.target && p.rtt.is_none()).count()).sum();
-    let typical = |tracks: &[PingTrack]| tracks.iter().find(|t| t.trustworthy()).and_then(|t| t.normal);
+    let on_path: Vec<&crate::model::Ping> =
+        rec.pings.iter().filter(|p| net.path.iter().any(|t| t.target == p.target)).collect();
+    let path: Vec<f32> = on_path.iter().filter_map(|p| p.rtt).collect();
+    // Jitter compares each answer with the one before it to the same target.
+    let mut last: HashMap<u32, f32> = HashMap::new();
+    let mut steps = Vec::new();
+    for p in &on_path {
+        if let Some(r) = p.rtt {
+            if let Some(prev) = last.insert(p.target, r) {
+                steps.push((r - prev).abs());
+            }
+        }
+    }
+    let jitter = mean(&steps);
+    let sent = on_path.len();
+    let lost = on_path.iter().filter(|p| p.rtt.is_none()).count();
+    let typical = |tracks: &[&PingTrack]| tracks.iter().find(|t| t.trustworthy()).and_then(|t| t.normal);
     let signal: Vec<f32> = rec.system.iter().filter_map(|s| s.wifi_signal).collect();
     Some(NetSummary {
         link: rec.connection.kind,
@@ -666,14 +704,18 @@ fn net_summary(rec: &Recording, net: &NetTracks, lag_spikes: u32) -> Option<NetS
 fn headline_for(c: &Culprit) -> String {
     let s = share(c.count, c.of, c.kind);
     match &c.cause {
-        Cause::App { label, .. } | Cause::AppDisk { label, .. } | Cause::AppNetwork { label, .. } => format!("{label} caused {s}."),
+        Cause::App { label, .. } | Cause::AppDisk { label, .. } | Cause::AppNetwork { label, .. } => {
+            format!("{label} caused {s}.")
+        }
         Cause::CpuMaxed => format!("Your CPU ran out of headroom: {s}."),
         Cause::CpuSlowed => format!("Your CPU slowed down mid-game: {s}."),
         Cause::RamFull => format!("Your PC ran out of memory: {s}."),
         Cause::VramFull => format!("Your GPU ran out of memory: {s}."),
         Cause::GpuThrottled => format!("Your GPU throttled itself: {s}."),
         Cause::GameCpu | Cause::GameGpu | Cause::GameLoading | Cause::Game => {
-            if c.count * 2 > c.of {
+            if c.of == 1 {
+                "Your only stutter came from the game itself, not your PC.".into()
+            } else if c.count * 2 > c.of {
                 "Most stutters came from the game itself, not your PC.".into()
             } else {
                 "Some stutters came from the game itself, not your PC.".into()
@@ -709,12 +751,12 @@ fn verdict(
 
     let mut facts = Vec::new();
     if let Some(p) = perf {
-        facts.push(format!("{game} averaged {:.0} fps, with 1% lows of {:.0}", p.avg_fps, p.low1_fps));
+        facts.push(format!("{game} averaged {:.0} fps, with 1% lows of {:.0}.", p.avg_fps, p.low1_fps));
     }
     if let Some(ping) = net.as_ref().and_then(|n| n.ping_ms) {
-        facts.push(format!("{ping:.0} ms ping to the server"));
+        facts.push(format!("Ping to the server was {ping:.0} ms."));
     }
-    let facts = if facts.is_empty() { String::new() } else { format!("{}.", facts.join(" and ")) };
+    let facts = facts.join(" ");
 
     if stutters + lag == 0 {
         return ("No stutters or lag spikes.".into(), facts, Mood::Good);
@@ -722,7 +764,9 @@ fn verdict(
 
     let main_kind = if stutters >= lag { IncidentKind::Stutter } else { IncidentKind::Lag };
     let main = culprits.iter().find(|c| c.kind == main_kind);
-    let headline = main.map(headline_for).unwrap_or_else(|| format!("{} this session.", share(stutters.max(lag), stutters.max(lag), main_kind)));
+    let headline = main
+        .map(headline_for)
+        .unwrap_or_else(|| format!("{} this session.", share(stutters.max(lag), stutters.max(lag), main_kind)));
 
     let mut detail = Vec::new();
     let counts = [(stutters, IncidentKind::Stutter), (lag, IncidentKind::Lag)]
@@ -731,14 +775,23 @@ fn verdict(
         .map(|(n, k)| plural(*n, noun(*k).0, noun(*k).1))
         .collect::<Vec<_>>()
         .join(" and ");
-    detail.push(format!("{counts} in {}.", if minutes < 1.5 { "about a minute".into() } else { format!("{minutes:.0} minutes") }));
+    detail.push(format!(
+        "{counts} in {}.",
+        if minutes < 1.5 { "about a minute".into() } else { format!("{minutes:.0} minutes") }
+    ));
     // A second cause worth acting on, or the top cause of the other kind.
-    if let Some(next) = culprits.iter().skip(1).find(|c| c.kind == main_kind && c.cause.is_actionable() && c.count >= 2) {
+    if let Some(next) = culprits.iter().skip(1).find(|c| c.kind == main_kind && c.cause.is_actionable() && c.count >= 2)
+    {
         detail.push(format!("{} caused {} more.", next.title, next.count));
     }
     let other_kind = if main_kind == IncidentKind::Stutter { IncidentKind::Lag } else { IncidentKind::Stutter };
     if let Some(other) = culprits.iter().find(|c| c.kind == other_kind) {
-        detail.push(format!("The {} were mostly down to {}.", noun(other_kind).1, lower_first(&other.title)));
+        let (one, many) = noun(other_kind);
+        detail.push(if other.of == 1 {
+            format!("The {one} came from {}.", cause_phrase(&other.cause))
+        } else {
+            format!("{} of the {} {many} came from {}.", other.count, other.of, cause_phrase(&other.cause))
+        });
     }
     if !facts.is_empty() {
         detail.push(facts);
@@ -750,13 +803,20 @@ fn verdict(
     (headline, detail.join(" "), mood)
 }
 
-fn lower_first(s: &str) -> String {
-    // "Your Wi-Fi" → "your Wi-Fi", but leave names like "Microsoft Defender" alone.
-    match s.split_whitespace().next() {
-        Some("Your" | "The") => {
-            let mut c = s.chars();
-            c.next().map(|f| f.to_lowercase().collect::<String>() + c.as_str()).unwrap_or_default()
-        }
-        _ => s.to_string(),
+/// The cause as it reads in the middle of a sentence: "came from {phrase}".
+fn cause_phrase(cause: &Cause) -> String {
+    match cause {
+        Cause::App { label, .. } | Cause::AppDisk { label, .. } | Cause::AppNetwork { label, .. } => label.clone(),
+        Cause::CpuMaxed => "your CPU maxing out".into(),
+        Cause::CpuSlowed => "your CPU slowing down".into(),
+        Cause::RamFull => "running out of RAM".into(),
+        Cause::VramFull => "the GPU running out of memory".into(),
+        Cause::GpuThrottled => "the GPU throttling itself".into(),
+        Cause::GameCpu | Cause::GameGpu | Cause::GameLoading | Cause::Game => "the game itself".into(),
+        Cause::HomeNetwork { wifi: true } => "your Wi-Fi".into(),
+        Cause::HomeNetwork { wifi: false } => "your home network".into(),
+        Cause::Isp => "your internet provider".into(),
+        Cause::Server => "the game server".into(),
+        Cause::Unknown => "nothing Culprit could see".into(),
     }
 }
