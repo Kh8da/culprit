@@ -62,6 +62,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: actions/setup-node@v4
         with:
@@ -69,14 +71,33 @@ jobs:
 
       - run: npm ci
 
+      # The recorder is Windows-only code, so only this job lints it.
+      - name: Lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Tests
         run: cargo test --workspace
 
       - name: Build app
         run: npx tauri build --no-bundle
 
+      # The recorder runs PresentMon for frames; it ships next to Culprit.exe.
+      - name: Add PresentMon
+        shell: pwsh
+        run: |
+          $exe = "target/release/PresentMon-2.6.0-x64.exe"
+          Invoke-WebRequest "https://github.com/GameTechDev/PresentMon/releases/download/v2.6.0/PresentMon-2.6.0-x64.exe" -OutFile $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          if ($hash -ne "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af") {
+            throw "PresentMon download doesn't match its checksum: $hash"
+          }
+          Copy-Item licenses/PresentMon.txt target/release/PresentMon-LICENSE.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: culprit-windows
-          path: target/release/Culprit.exe
+          path: |
+            target/release/Culprit.exe
+            target/release/PresentMon-2.6.0-x64.exe
+            target/release/PresentMon-LICENSE.txt
           if-no-files-found: error

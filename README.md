@@ -12,8 +12,8 @@
 to do about it.
 
 > **Status: work in progress.** The analysis engine, the app and its report screens are built and tested. The
-> Windows recorder that collects the data during a real game isn't written yet, so this build shows reports and
-> an example, but can't record. There is no download yet.
+> Windows recorder is written and its logic is tested, but it is new and still needs trying on real games and
+> PCs. There is no download yet.
 
 ## What a report tells you
 
@@ -39,6 +39,27 @@ to do about it.
 - **What it ignores.** The slow frames right after alt-tabbing back in, loading screens, the server going
   quiet when a match ends, and single stray pings that routers drop on purpose.
 
+## What it records, and what it never does
+
+Press Start recording, play, press Stop. Windows asks for administrator rights when a recording starts, because
+only administrators may trace frames and network traffic. Culprit then reads what Windows already reports to any monitoring tool:
+
+- **Frames** from [PresentMon](https://github.com/GameTechDev/PresentMon), Intel's frame tracer, which runs next
+  to Culprit as its own program. Culprit locks on to the game in front once it draws 20 fps or more for two
+  seconds.
+- **Network traffic** from Windows' own network trace: which program sent or received how many bytes, and to
+  which address. That is how Culprit finds the game server. No packet's contents are read.
+- **The whole PC once a second**, like Task Manager: CPU, memory, disk, GPU use, temperature and throttling,
+  Wi-Fi signal, and every program's CPU, disk and network use.
+- **Pings** to your router, your provider's first hop and the game server, four a second.
+- **Ctrl+Alt+L** marks a moment, through a registered hotkey.
+
+Nothing is injected into the game and nothing reads its memory. Culprit opens no other process at all and
+installs no keyboard hook and no driver; PresentMon opens each program that draws only with the query-only
+access Task Manager uses, to read its name. The pings, and the traceroute that finds your provider's hop (pings
+with a hop limit), are the only packets Culprit sends. The PC is sampled once a second and frames and packets are
+only counted, so the recorder stays light while you play.
+
 ## Fast on purpose
 
 - A three-hour session at 240 fps (2.6 million frames, 120 background apps) is analyzed in under half a second.
@@ -51,7 +72,7 @@ to do about it.
 | Folder | What it is |
 |---|---|
 | `core` | The analysis engine (`culpritcore`): detection, cause attribution, wording, charts, example sessions. |
-| `capture` | Builds a recording from raw events and works out which program is the game and which address is its server. |
+| `capture` | The recorder: reads frames, packets, pings and the PC on Windows, works out which program is the game and which address is its server, and builds the recording. |
 | `src-tauri` | The desktop app: session storage and the commands the UI calls. |
 | `ui` | The app's screens. |
 | `ui-dev` | A stand-in backend for previewing the UI in a browser, and the UI check. |
@@ -74,6 +95,12 @@ npx http-server -p 8765 -s .
 Then open `http://127.0.0.1:8765/ui/index.html`. Add `?record` to the address to try the live view with fake
 data. `node ui-dev/check.js` walks through every screen in Chromium and fails on any error.
 
+To record from a dev build on Windows, put
+[PresentMon-2.6.0-x64.exe](https://github.com/GameTechDev/PresentMon/releases/tag/v2.6.0) next to the built
+`culprit.exe` (or point `CULPRIT_PRESENTMON` at it) and start `npx tauri dev` from an administrator terminal. The
+CI build ships PresentMon next to `Culprit.exe`.
+
 ## License
 
-MIT. Geist and Geist Mono are under the SIL Open Font License (`ui/fonts/OFL.txt`).
+MIT. Geist and Geist Mono are under the SIL Open Font License (`ui/fonts/OFL.txt`). PresentMon is Intel's, under
+the MIT license (`licenses/PresentMon.txt`).

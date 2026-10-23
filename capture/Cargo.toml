@@ -1,7 +1,7 @@
 [package]
 name = "culprit-capture"
 version = "0.1.0"
-description = "Turns raw events from a play session (frames, packets, pings, per-second PC samples) into a Culprit recording."
+description = "Records a play session on Windows (frames, packets, pings, per-second PC samples) and turns it into a Culprit recording."
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Kh8da/culprit"
@@ -10,3 +10,30 @@ repository = "https://github.com/Kh8da/culprit"
 culpritcore = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Wdk_Graphics_Direct3D",
+    "Wdk_System_SystemInformation",
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

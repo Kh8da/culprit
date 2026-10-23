@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 culpritcore = { path = "../core" }
+culprit-capture = { path = "../capture" }
 tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }

@@ -31,6 +31,7 @@ impl Summary {
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }
@@ -104,8 +105,7 @@ impl Store {
         fs::read(path).map_err(|_| "that session is gone".to_string())
     }
 
-    /// Saves a finished session. The recorder calls this; until it lands only the tests do.
-    #[allow(dead_code)]
+    /// Saves a finished session.
     pub fn save(&self, session: &Session) -> Result<(), String> {
         let path = self.session_path(&session.id).ok_or("not a session")?;
         fs::create_dir_all(&self.dir).map_err(|e| format!("couldn't create the sessions folder: {e}"))?;
